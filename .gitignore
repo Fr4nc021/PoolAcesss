@@ -1,0 +1,61 @@
+# --- Ambiente e segredos ---
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+secrets/
+credentials*
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+.eggs/
+dist/
+build/
+pip-wheel-metadata/
+.Python
+.venv/
+venv/
+env/
+ENV/
+
+# --- Dados locais da aplicação ---
+data/*.db
+data/*.db-*
+data/photos/
+uploads/
+*.log
+*.sqlite
+*.sqlite3
+
+# --- Dumps / artefatos de probe (sensíveis) ---
+scripts/_*
+scripts/**/_*
+
+# --- Empacotamento / PyInstaller ---
+*.spec.bak
+*.manifest
+
+# --- IDE / SO ---
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# --- Testes / cobertura ---
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
