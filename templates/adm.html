@@ -1,0 +1,296 @@
+{% extends "base.html" %}
+{% block title %}ADM — Acesso Piscinas Clube Aliança{% endblock %}
+
+{% block content %}
+<section class="panel">
+  <div class="panel-head">
+    <div>
+      <h1>ADM</h1>
+      <p class="lead">
+        Painel rápido de sócios, vencimentos, bloqueios e acessos registrados.
+      </p>
+    </div>
+    <form method="post" action="{{ url_for('main.adm_sincronizar_logs') }}">
+      <button type="submit" class="btn btn-secondary">Sincronizar logs do XPE</button>
+    </form>
+  </div>
+
+  {% if sync_note %}
+  <p class="hint sync-note">{{ sync_note }}</p>
+  {% endif %}
+
+  <div class="stats-grid">
+    <div class="stat-card">
+      <p class="stat-label">Sócios cadastrados</p>
+      <p class="stat-value">{{ stats.total_members }}</p>
+    </div>
+    <div class="stat-card">
+      <p class="stat-label">Acessos (7 dias)</p>
+      <p class="stat-value">{{ stats.accesses_week }}</p>
+    </div>
+    <div class="stat-card">
+      <p class="stat-label">Acessos (30 dias)</p>
+      <p class="stat-value">{{ stats.accesses_month }}</p>
+    </div>
+    <div class="stat-card">
+      <p class="stat-label">Negados (7 dias)</p>
+      <p class="stat-value">{{ stats.denied_week }}</p>
+    </div>
+    <div class="stat-card">
+      <p class="stat-label">Exames vencidos</p>
+      <p class="stat-value">{{ stats.expired_count }}</p>
+    </div>
+    <div class="stat-card">
+      <p class="stat-label">Bloqueados</p>
+      <p class="stat-value">{{ stats.blocked_count }}</p>
+    </div>
+  </div>
+</section>
+
+<section class="panel adm-section">
+  <h2>Vencimentos</h2>
+  <p class="lead">Exames vencidos e próximos a vencer (7 dias).</p>
+
+  <h3 class="subhead">Vencidos</h3>
+  {% if expired_members %}
+  <div class="table-wrap">
+    <table class="members-table">
+      <thead>
+        <tr>
+          <th>Nome</th>
+          <th>Venceu em</th>
+          <th>Status</th>
+          <th></th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for m in expired_members %}
+        <tr>
+          <td>{{ m.name }}</td>
+          <td>{{ m.medical_exam_expires_at.strftime('%d/%m/%Y %H:%M') }}</td>
+          <td><span class="badge {{ m.status_class }}">{{ m.status_label }}</span></td>
+          <td class="actions">
+            <form method="post" action="{{ url_for('main.renovar', member_id=m.id) }}"
+                  onsubmit="return confirm('Renovar exame de {{ m.name }}?');">
+              <button type="submit" class="btn btn-secondary">OK exame</button>
+            </form>
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+  <p class="empty">Nenhum exame vencido.</p>
+  {% endif %}
+
+  <h3 class="subhead">Vencem em até 7 dias</h3>
+  {% if expiring_members %}
+  <div class="table-wrap">
+    <table class="members-table">
+      <thead>
+        <tr>
+          <th>Nome</th>
+          <th>Válido até</th>
+          <th>Status</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for m in expiring_members %}
+        <tr>
+          <td>{{ m.name }}</td>
+          <td>{{ m.medical_exam_expires_at.strftime('%d/%m/%Y %H:%M') }}</td>
+          <td><span class="badge {{ m.status_class }}">{{ m.status_label }}</span></td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+  <p class="empty">Nenhum vencimento próximo.</p>
+  {% endif %}
+</section>
+
+<section class="panel adm-section">
+  <h2>Bloqueios</h2>
+  <p class="lead">Bloqueie o acesso facial de um sócio (remove do equipamento).</p>
+
+  <form method="post" class="inline-form" id="block-form"
+        onsubmit="return confirm('Confirmar bloqueio deste sócio?');">
+    <label class="field grow">
+      <span>Sócio</span>
+      <select name="member_id" id="block-member" required>
+        <option value="">Selecione…</option>
+        {% for m in all_members if not m.access_blocked %}
+        <option value="{{ m.id }}">{{ m.name }} ({{ m.registration }})</option>
+        {% endfor %}
+      </select>
+    </label>
+    <button type="submit" class="btn btn-danger">Bloquear acesso</button>
+  </form>
+  <script>
+    const blockForm = document.getElementById("block-form");
+    const blockSelect = document.getElementById("block-member");
+    blockForm.addEventListener("submit", (e) => {
+      const id = blockSelect.value;
+      if (!id) {
+        e.preventDefault();
+        return;
+      }
+      blockForm.action = `/adm/membros/${id}/bloquear`;
+    });
+  </script>
+
+  {% if blocked_members %}
+  <div class="table-wrap" style="margin-top:1rem">
+    <table class="members-table">
+      <thead>
+        <tr>
+          <th>Nome</th>
+          <th>Matrícula</th>
+          <th>Status</th>
+          <th></th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for m in blocked_members %}
+        <tr>
+          <td>{{ m.name }}</td>
+          <td class="mono">{{ m.registration }}</td>
+          <td><span class="badge status-expired">{{ m.status_label }}</span></td>
+          <td class="actions">
+            <form method="post" action="{{ url_for('main.renovar', member_id=m.id) }}"
+                  onsubmit="return confirm('Liberar novamente {{ m.name }} com OK exame?');">
+              <button type="submit" class="btn btn-secondary">OK exame / liberar</button>
+            </form>
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+  <p class="empty">Nenhum bloqueio ativo.</p>
+  {% endif %}
+</section>
+
+<section class="panel adm-section">
+  <h2>Atualizar foto</h2>
+  <p class="lead">Troque a foto facial de um sócio quando necessário.</p>
+
+  <form method="post" enctype="multipart/form-data" class="inline-form" id="photo-form">
+    <label class="field grow">
+      <span>Sócio</span>
+      <select name="member_pick" id="photo-member" required>
+        <option value="">Selecione…</option>
+        {% for m in all_members %}
+        <option value="{{ m.id }}">{{ m.name }} ({{ m.registration }})</option>
+        {% endfor %}
+      </select>
+    </label>
+    <label class="field">
+      <span>Nova foto</span>
+      <input type="file" name="photo" accept="image/jpeg,image/png,image/webp,image/bmp" required>
+    </label>
+    <button type="submit" class="btn btn-primary">Atualizar foto</button>
+  </form>
+  <script>
+    const photoForm = document.getElementById("photo-form");
+    const photoSelect = document.getElementById("photo-member");
+    photoForm.addEventListener("submit", () => {
+      const id = photoSelect.value;
+      if (id) photoForm.action = `/adm/membros/${id}/foto`;
+    });
+  </script>
+</section>
+
+<section class="panel adm-section">
+  <h2>Acessos aprovados</h2>
+  {% if approved_events %}
+  <div class="table-wrap">
+    <table class="members-table">
+      <thead>
+        <tr>
+          <th>Quando</th>
+          <th>Nome</th>
+          <th>Matrícula</th>
+          <th>Origem</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for e in approved_events %}
+        <tr>
+          <td>{{ e.event_at.strftime('%d/%m/%Y %H:%M') }}</td>
+          <td>{{ e.member_name or '—' }}</td>
+          <td class="mono">{{ e.registration or '—' }}</td>
+          <td>{{ e.source }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+  <p class="empty">Nenhum acesso aprovado registrado ainda. Use “Sincronizar logs do XPE”.</p>
+  {% endif %}
+</section>
+
+<section class="panel adm-section">
+  <h2>Acessos negados</h2>
+  {% if denied_events %}
+  <div class="table-wrap">
+    <table class="members-table">
+      <thead>
+        <tr>
+          <th>Quando</th>
+          <th>Nome</th>
+          <th>Matrícula</th>
+          <th>Detalhe</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for e in denied_events %}
+        <tr>
+          <td>{{ e.event_at.strftime('%d/%m/%Y %H:%M') }}</td>
+          <td>{{ e.member_name or '—' }}</td>
+          <td class="mono">{{ e.registration or '—' }}</td>
+          <td>{{ e.detail or '—' }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+  <p class="empty">Nenhum acesso negado registrado.</p>
+  {% endif %}
+</section>
+
+<section class="panel adm-section">
+  <h2>Histórico de bloqueios</h2>
+  {% if blocked_events %}
+  <div class="table-wrap">
+    <table class="members-table">
+      <thead>
+        <tr>
+          <th>Quando</th>
+          <th>Nome</th>
+          <th>Matrícula</th>
+          <th>Detalhe</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for e in blocked_events %}
+        <tr>
+          <td>{{ e.event_at.strftime('%d/%m/%Y %H:%M') }}</td>
+          <td>{{ e.member_name or '—' }}</td>
+          <td class="mono">{{ e.registration or '—' }}</td>
+          <td>{{ e.detail or '—' }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+  <p class="empty">Nenhum bloqueio registrado no histórico.</p>
+  {% endif %}
+</section>
+{% endblock %}
