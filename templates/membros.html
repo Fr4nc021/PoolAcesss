@@ -1,0 +1,108 @@
+{% extends "base.html" %}
+{% block title %}Membros — Acesso Piscinas Clube Aliança{% endblock %}
+
+{% block content %}
+<section class="panel">
+  <h1>Membros</h1>
+  <p class="lead">
+    Acompanhe o vencimento do exame médico. Use <strong>OK exame médico</strong>
+    para renovar o acesso por mais {{ validity_days }} dias.
+  </p>
+
+  {% if members %}
+  <div class="toolbar">
+    <label class="search-field">
+      <span class="sr-only">Buscar membro</span>
+      <input
+        type="search"
+        id="member-search"
+        placeholder="Buscar por nome ou matrícula…"
+        autocomplete="off"
+      >
+    </label>
+    <div class="filter-group" role="group" aria-label="Filtro de exame">
+      <button type="button" class="filter-btn is-active" data-filter="todos">Todos</button>
+      <button type="button" class="filter-btn" data-filter="valido">Exames válidos</button>
+      <button type="button" class="filter-btn" data-filter="vencido">Exames vencidos</button>
+    </div>
+  </div>
+  <p class="filter-meta" id="filter-meta"></p>
+
+  <div class="table-wrap">
+    <table class="members-table" id="members-table">
+      <thead>
+        <tr>
+          <th>Nome</th>
+          <th>Matrícula</th>
+          <th>Exame válido até</th>
+          <th>Status</th>
+          <th></th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for m in members %}
+        <tr
+          data-name="{{ m.name|lower }}"
+          data-reg="{{ m.registration|lower }}"
+          data-exam="{{ m.exam_filter }}"
+        >
+          <td>{{ m.name }}</td>
+          <td class="mono">{{ m.registration }}</td>
+          <td>{{ m.medical_exam_expires_at.strftime('%d/%m/%Y %H:%M') }}</td>
+          <td><span class="badge {{ m.status_class }}">{{ m.status_label }}</span></td>
+          <td class="actions">
+            <form method="post" action="{{ url_for('main.renovar', member_id=m.id) }}"
+                  onsubmit="return confirm('Confirmar OK do exame médico para {{ m.name }}?');">
+              <button type="submit" class="btn btn-secondary">OK exame médico</button>
+            </form>
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  <p class="empty" id="no-results" hidden>Nenhum membro encontrado com esse filtro.</p>
+  {% else %}
+  <p class="empty">Nenhum membro cadastrado ainda.</p>
+  {% endif %}
+</section>
+
+{% if members %}
+<script>
+  const searchInput = document.getElementById("member-search");
+  const rows = Array.from(document.querySelectorAll("#members-table tbody tr"));
+  const filterButtons = Array.from(document.querySelectorAll(".filter-btn"));
+  const noResults = document.getElementById("no-results");
+  const filterMeta = document.getElementById("filter-meta");
+  let activeFilter = "todos";
+
+  function applyFilters() {
+    const q = (searchInput.value || "").trim().toLowerCase();
+    let visible = 0;
+    rows.forEach((row) => {
+      const name = row.dataset.name || "";
+      const reg = row.dataset.reg || "";
+      const exam = row.dataset.exam || "";
+      const matchesSearch = !q || name.includes(q) || reg.includes(q);
+      const matchesFilter = activeFilter === "todos" || exam === activeFilter;
+      const show = matchesSearch && matchesFilter;
+      row.hidden = !show;
+      if (show) visible += 1;
+    });
+    noResults.hidden = visible > 0;
+    const labels = { todos: "todos", valido: "válidos", vencido: "vencidos" };
+    filterMeta.textContent = `${visible} membro(s) — filtro: ${labels[activeFilter]}`;
+  }
+
+  searchInput.addEventListener("input", applyFilters);
+  filterButtons.forEach((btn) => {
+    btn.addEventListener("click", () => {
+      activeFilter = btn.dataset.filter;
+      filterButtons.forEach((b) => b.classList.toggle("is-active", b === btn));
+      applyFilters();
+    });
+  });
+  applyFilters();
+</script>
+{% endif %}
+{% endblock %}

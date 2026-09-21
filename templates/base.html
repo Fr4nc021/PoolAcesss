@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>{% block title %}Acesso Piscinas Clube Aliança{% endblock %}</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+  <div class="page">
+    <header class="top">
+      <div class="brand">
+        <img
+          class="brand-logo"
+          src="{{ url_for('static', filename='logo-clube-alianca.png') }}"
+          alt="Clube Aliança"
+        >
+        <p class="brand-name">Acesso Piscinas Clube Aliança</p>
+      </div>
+      <nav class="nav">
+        <a href="{{ url_for('main.cadastrar') }}" class="nav-link {% if request.endpoint == 'main.cadastrar' %}is-active{% endif %}">Cadastrar</a>
+        <a href="{{ url_for('main.membros') }}" class="nav-link {% if request.endpoint == 'main.membros' %}is-active{% endif %}">Membros</a>
+        <a href="{{ url_for('main.adm') }}" class="nav-link {% if request.endpoint == 'main.adm' %}is-active{% endif %}">ADM</a>
+      </nav>
+    </header>
+
+    {% with messages = get_flashed_messages(with_categories=true) %}
+      {% if messages %}
+        <div class="flash-list">
+          {% for category, message in messages %}
+            <div class="flash flash-{{ category }}">{{ message }}</div>
+          {% endfor %}
+        </div>
+      {% endif %}
+    {% endwith %}
+
+    <main class="main">
+      {% block content %}{% endblock %}
+    </main>
+  </div>
+</body>
+</html>
