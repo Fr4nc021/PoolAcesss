@@ -28,7 +28,12 @@ if not exist ".env" (
 )
 
 echo.
+echo Criando atalho na area de trabalho...
+".venv\Scripts\python.exe" -c "from app.shortcut import ensure_desktop_shortcut; ensure_desktop_shortcut()"
+
+echo.
 echo Instalacao concluida.
-echo Para iniciar: dê dois cliques em INICIAR.bat
+echo Atalho "Acesso Piscinas" na area de trabalho.
+echo Para iniciar: dê dois cliques nesse atalho, ou em INICIAR.bat
 echo.
 pause

@@ -5,7 +5,7 @@
 <section class="panel">
   <h1>Cadastrar membro</h1>
   <p class="lead">
-    Informe o nome e tire a foto na hora (ou envie um arquivo).
+    Informe o nome, escolha uma piscina ou as duas, e tire a foto na hora (ou envie um arquivo).
     O acesso fica liberado por {{ validity_days }} dias, vinculados ao exame médico.
   </p>
 
@@ -17,6 +17,21 @@
       <span>Nome</span>
       <input type="text" name="name" required maxlength="120" placeholder="Nome completo" autocomplete="name">
     </label>
+
+    <fieldset class="field pool-choice">
+      <legend>Piscina</legend>
+      <div class="pool-options">
+        {% for pool in pools %}
+        <label class="pool-option">
+          <input type="checkbox" name="pool" value="{{ pool.id }}">
+          <span>
+            <strong>{{ pool.label }}</strong>
+            <small>{{ pool.url }}</small>
+          </span>
+        </label>
+        {% endfor %}
+      </div>
+    </fieldset>
 
     <div class="field">
       <span>Foto do rosto</span>
@@ -48,6 +63,10 @@
     <p class="hint" id="photo-status" hidden>Foto pronta para cadastro.</p>
 
     <button type="submit" class="btn btn-primary" id="submit-btn">Cadastrar e liberar acesso</button>
+    <p class="wait-status" id="wait-status" hidden role="status" aria-live="polite">
+      Cadastrando, aguarde
+      <span class="wait-dots" aria-hidden="true"><span></span><span></span><span></span></span>
+    </p>
   </form>
 </section>
 
@@ -57,6 +76,7 @@
   const preview = document.getElementById("photo-preview");
   const form = document.getElementById("cadastro-form");
   const btn = document.getElementById("submit-btn");
+  const waitStatus = document.getElementById("wait-status");
   const errBox = document.getElementById("form-error");
   const infoBox = document.getElementById("form-info");
   const cameraBox = document.getElementById("camera-box");
@@ -80,6 +100,14 @@
     infoBox.textContent = msg;
     infoBox.hidden = false;
     errBox.hidden = true;
+  }
+
+  function setBusy(busy) {
+    btn.disabled = busy;
+    waitStatus.hidden = !busy;
+    form.querySelectorAll("input, button").forEach((el) => {
+      el.disabled = busy;
+    });
   }
 
   function setPreviewFromFile(file) {
@@ -202,18 +230,23 @@
       showError("Informe o nome da pessoa.");
       return;
     }
+    const selectedPools = Array.from(form.querySelectorAll('input[name="pool"]:checked'));
+    if (!selectedPools.length) {
+      showError("Selecione ao menos uma piscina: normal, térmica ou as duas.");
+      return;
+    }
     const file = capturedFile || (input.files && input.files[0]);
     if (!file) {
       showError("Tire uma foto com a câmera ou escolha um arquivo.");
       return;
     }
 
-    btn.disabled = true;
-    btn.textContent = "Cadastrando no equipamento…";
+    setBusy(true);
 
     try {
       const body = new FormData();
       body.append("name", name);
+      selectedPools.forEach((item) => body.append("pool", item.value));
       body.append("photo", file, file.name || "foto.jpg");
 
       const response = await fetch(form.action + "?format=json", {
@@ -241,11 +274,11 @@
         throw new Error((data && data.error) || ("Falha HTTP " + response.status));
       }
 
+      if (window.__acessoStay) window.__acessoStay();
       window.location.href = data.redirect || "{{ url_for('main.membros') }}";
     } catch (err) {
       showError(err.message || String(err));
-      btn.disabled = false;
-      btn.textContent = "Cadastrar e liberar acesso";
+      setBusy(false);
     }
   });
 

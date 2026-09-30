@@ -22,6 +22,10 @@
         <a href="{{ url_for('main.membros') }}" class="nav-link {% if request.endpoint == 'main.membros' %}is-active{% endif %}">Membros</a>
         <a href="{{ url_for('main.adm') }}" class="nav-link {% if request.endpoint == 'main.adm' %}is-active{% endif %}">ADM</a>
       </nav>
+      <p class="sync-status" aria-label="Sincronização">
+        <span class="{{ sync_status.peer_class }}">Outro PC: {{ sync_status.peer }}</span>
+        <span class="{{ sync_status.cloud_class }}">Nuvem: {{ sync_status.cloud }}</span>
+      </p>
     </header>
 
     {% with messages = get_flashed_messages(with_categories=true) %}
@@ -38,5 +42,41 @@
       {% block content %}{% endblock %}
     </main>
   </div>
+  <script>
+    (function () {
+      let navegandoPorDentro = false;
+
+      function continuarNoPrograma() {
+        navegandoPorDentro = true;
+      }
+
+      window.__acessoStay = continuarNoPrograma;
+
+      document.addEventListener("click", function (event) {
+        const link = event.target.closest && event.target.closest("a");
+        if (!link || !link.href) return;
+        try {
+          const url = new URL(link.href, window.location.href);
+          if (url.origin === window.location.origin) continuarNoPrograma();
+        } catch (_) {}
+      }, true);
+
+      document.addEventListener("submit", continuarNoPrograma, true);
+
+      window.addEventListener("keydown", function (event) {
+        const key = (event.key || "").toLowerCase();
+        if (key === "f5" || ((event.ctrlKey || event.metaKey) && key === "r")) {
+          continuarNoPrograma();
+        }
+      });
+
+      window.addEventListener("pagehide", function (event) {
+        if (event.persisted || navegandoPorDentro) return;
+        if (navigator.sendBeacon) {
+          navigator.sendBeacon("{{ url_for('main.fechar_aba') }}");
+        }
+      });
+    })();
+  </script>
 </body>
 </html>
