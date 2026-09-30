@@ -44,8 +44,23 @@ copy .env.example .env
 | `SECRET_KEY` | Chave Flask — use um valor único em produção |
 | `VALIDITY_DAYS` | Dias de validade após o exame (padrão 30) |
 | `DOOR_NUM` | Canal OpenDoor no equipamento |
+| `SYNC_PEER_URL` | Endereço do outro PC, ex.: `http://192.168.x.x:5000` |
+| `SYNC_TOKEN` | Segredo igual nos dois PCs para a troca na rede local |
+| `SYNC_INTERVAL_SECONDS` | Intervalo da troca (padrão 20) |
+| `SUPABASE_URL` / `SUPABASE_KEY` | Backup na nuvem. A chave é a `service_role` |
 
 O arquivo `.env` está no `.gitignore` e **não deve** ser versionado.
+
+### Dois PCs e backup
+
+Cada PC roda o programa e guarda o próprio banco. Na rede do clube, um puxa o outro a cada 20 segundos, sem internet. Com internet, as mesmas matrículas, exames e fotos sobem para o Supabase e o outro PC baixa de lá.
+
+1. No SQL Editor do Supabase, rode [`scripts/supabase_schema.sql`](scripts/supabase_schema.sql).
+2. Nos dois `.env`, use a mesma `SUPABASE_URL`, a mesma `SUPABASE_KEY` (`service_role`) e o mesmo `SYNC_TOKEN`.
+3. `SYNC_PEER_URL` em cada PC é o endereço do outro (`http://IP:5000`).
+4. Libere a porta 5000 no firewall do Windows entre os dois PCs.
+
+O topo da tela mostra **Outro PC** e **Nuvem**. Sem `SYNC_PEER_URL` ou sem `SUPABASE_URL`, aquele caminho fica desligado e o restante do programa segue igual.
 
 ---
 
