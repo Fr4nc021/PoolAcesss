@@ -4,9 +4,10 @@ from PyInstaller.utils.hooks import collect_all
 datas = [
     ('templates', 'templates'),
     ('static', 'static'),
+    ('assets/aquaaccess.ico', '.'),
 ]
 binaries = []
-hiddenimports = ['app', 'app.main', 'app.routes', 'app.db', 'app.config', 'app.expiry', 'app.intelbras_client']
+hiddenimports = ['app', 'app.main', 'app.routes', 'app.db', 'app.config', 'app.expiry', 'app.intelbras_client', 'app.shortcut', 'app.tray', 'pystray', 'pystray._win32']
 
 tmp_ret = collect_all('flask')
 datas += tmp_ret[0]
@@ -34,11 +35,12 @@ exe = EXE(
     [],
     exclude_binaries=True,
     name='AcessoPiscinas',
+    icon='assets/aquaaccess.ico',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
     upx=True,
-    console=True,
+    console=False,
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=None,

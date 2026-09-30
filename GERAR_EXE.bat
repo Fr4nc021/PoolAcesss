@@ -21,6 +21,7 @@ if exist "%DIST%" rmdir /s /q "%DIST%"
 mkdir "%DIST%"
 xcopy /E /I /Y "dist\AcessoPiscinas\*" "%DIST%\" >nul
 
+copy /Y "assets\aquaaccess.ico" "%DIST%\aquaaccess.ico" >nul
 copy /Y ".env.example" "%DIST%\.env.example" >nul
 if exist ".env" (
   copy /Y ".env" "%DIST%\.env" >nul
@@ -34,10 +35,12 @@ echo ==================================
 echo.
 echo 1. Edite o arquivo .env se precisar ^(IP do XPE, senha^).
 echo 2. Dê dois cliques em AcessoPiscinas.exe
+echo    Na primeira abertura surge o atalho Acesso Piscinas na area de trabalho.
 echo 3. O Chrome abre em http://127.0.0.1:5000
-echo 4. Em outro PC da rede: http://192.168.15.4:5000
+echo 4. Em outro PC da rede: http://IP-DESTE-PC:5000
 echo.
-echo Nao feche a janela preta enquanto usar o sistema.
+echo Nao ha janela preta. Para fechar, clique no icone ao lado do relogio
+echo e confirme "Fechar programa". O sistema sincroniza antes de sair.
 echo.
 ) > "%DIST%\LEIA-ME.txt"
 
