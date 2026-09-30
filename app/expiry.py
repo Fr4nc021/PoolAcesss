@@ -6,7 +6,7 @@ from typing import Optional
 
 from app import db
 from app.config import EXPIRY_CHECK_MINUTES
-from app.intelbras_client import DeviceError, IntelbrasClient
+from app.intelbras_client import DeviceError, DeviceFleet, IntelbrasClient, fleet_for_pool
 
 logger = logging.getLogger(__name__)
 
@@ -15,23 +15,45 @@ _thread: Optional[threading.Thread] = None
 
 
 def sync_expired_members(client: Optional[IntelbrasClient] = None) -> int:
-    """Remove do equipamento membros com exame médico vencido."""
+    """Remove dos faciais membros com exame médico vencido."""
+    try:
+        from app.sync import refresh_from_peers
+
+        refresh_from_peers()
+    except Exception:
+        logger.exception("Falha ao atualizar cadastros antes de bloquear vencidos")
     expired = db.list_expired_unblocked()
     if not expired:
         return 0
 
-    device = client or IntelbrasClient()
     blocked = 0
-
-    try:
-        device.ping()
-    except DeviceError as exc:
-        logger.error("Não foi possível autenticar no equipamento para bloquear vencidos: %s", exc)
-        return 0
+    ready: dict[str, DeviceFleet] = {}
+    offline: set[str] = set()
 
     for member in expired:
+        if client is not None:
+            fleet = DeviceFleet([client])
+            key = client.base_url or ""
+        else:
+            fleet = fleet_for_pool(member.pool)
+            key = ",".join(item.base_url or "" for item in fleet.clients)
+        if key in offline:
+            continue
+        if key not in ready:
+            unreachable = [item for item in fleet.status() if not item.get("ok")]
+            if unreachable:
+                offline.add(key)
+                logger.error(
+                    "Não foi possível autenticar no facial para bloquear vencidos: %s",
+                    "; ".join(
+                        f"{item.get('url')}: {item.get('error')}" for item in unreachable
+                    ),
+                )
+                continue
+            ready[key] = fleet
+        fleet = ready[key]
         try:
-            device.block_user(
+            fleet.block_user(
                 device_user_id=member.device_user_id or 0,
                 registration=member.registration,
             )
@@ -43,18 +65,7 @@ def sync_expired_members(client: Optional[IntelbrasClient] = None) -> int:
                 member.registration,
             )
         except DeviceError as exc:
-            # Se já não existe no aparelho, ainda marcamos como bloqueado localmente
-            msg = str(exc).lower()
-            if "failed" in msg or "não" in msg or "not" in msg:
-                db.mark_blocked(member.id)
-                blocked += 1
-                logger.warning(
-                    "Membro %s marcado bloqueado (aparelho: %s)",
-                    member.id,
-                    exc,
-                )
-            else:
-                logger.error("Falha ao bloquear member_id=%s: %s", member.id, exc)
+            logger.error("Falha ao bloquear member_id=%s: %s", member.id, exc)
 
     return blocked
 

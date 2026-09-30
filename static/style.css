@@ -106,6 +106,28 @@ body {
   border-color: var(--line);
 }
 
+.sync-status {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 0.35rem 1.25rem;
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.82rem;
+}
+
+.sync-status .is-ok {
+  color: var(--ok);
+}
+
+.sync-status .is-wait {
+  color: var(--warn);
+}
+
+.sync-status .is-muted {
+  color: var(--muted);
+}
+
 .panel {
   background: var(--panel);
   backdrop-filter: blur(10px);
@@ -117,6 +139,104 @@ body {
 
 .adm-section {
   margin-top: 1rem;
+}
+
+.adm-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+  margin: 0 0 1.25rem;
+}
+
+.adm-tab {
+  appearance: none;
+  border: 1px solid var(--line);
+  background: #fff;
+  color: var(--muted);
+  font: inherit;
+  font-weight: 700;
+  font-size: 0.95rem;
+  padding: 0.6rem 0.95rem;
+  border-radius: 999px;
+  cursor: pointer;
+}
+
+.adm-tab:hover {
+  color: var(--ink);
+}
+
+.adm-tab.is-active {
+  color: #fff;
+  background: var(--teal);
+  border-color: var(--teal);
+}
+
+.tab-count {
+  display: inline-block;
+  margin-left: 0.35rem;
+  padding: 0.05rem 0.45rem;
+  border-radius: 999px;
+  background: rgba(20, 48, 58, 0.08);
+  font-size: 0.75rem;
+  font-weight: 700;
+}
+
+.adm-tab.is-active .tab-count {
+  background: rgba(255, 255, 255, 0.22);
+  color: #fff;
+}
+
+.adm-panel[hidden] {
+  display: none !important;
+}
+
+.stat-link {
+  appearance: none;
+  font: inherit;
+  color: inherit;
+  text-align: left;
+  width: 100%;
+  cursor: pointer;
+}
+
+.adm-panel > .filter-group {
+  margin-bottom: 1rem;
+}
+
+.stat-link:hover {
+  border-color: rgba(15, 110, 124, 0.45);
+}
+
+.row-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+  width: 16.4rem;
+  margin-left: auto;
+}
+
+.row-actions form {
+  flex: 1 1 calc(50% - 0.35rem);
+  display: flex;
+  margin: 0;
+}
+
+.row-actions .btn,
+.row-actions .file-btn {
+  width: 100%;
+  justify-content: center;
+  text-align: center;
+  white-space: nowrap;
+}
+
+.btn-sm {
+  padding: 0.45rem 0.7rem;
+  font-size: 0.82rem;
+  border-radius: 10px;
+}
+
+.actions {
+  white-space: normal;
 }
 
 .panel-head {
@@ -283,7 +403,7 @@ body {
 .form {
   display: grid;
   gap: 1rem;
-  max-width: 32rem;
+  max-width: 40rem;
 }
 
 .field {
@@ -310,6 +430,65 @@ body {
 .field input[type="text"]:focus {
   outline: 2px solid rgba(15, 110, 124, 0.35);
   border-color: var(--teal);
+}
+
+.pool-choice {
+  border: 0;
+  margin: 0;
+  padding: 0;
+  min-width: 0;
+}
+
+.pool-choice legend {
+  font-weight: 600;
+  font-size: 0.92rem;
+  padding: 0;
+  margin-bottom: 0.45rem;
+}
+
+.pool-options {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0.6rem;
+}
+
+.pool-option {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.55rem;
+  margin: 0;
+  padding: 0.75rem 0.8rem;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: #fff;
+  cursor: pointer;
+}
+
+.pool-option:has(input:checked) {
+  border-color: var(--teal);
+  box-shadow: 0 0 0 2px rgba(15, 110, 124, 0.2);
+}
+
+.pool-option input {
+  margin-top: 0.2rem;
+}
+
+.pool-option strong,
+.pool-option small {
+  display: block;
+}
+
+.pool-option small {
+  margin-top: 0.15rem;
+  color: var(--muted);
+  font-size: 0.78rem;
+  word-break: break-all;
+}
+
+@media (max-width: 520px) {
+  .pool-options {
+    grid-template-columns: 1fr;
+  }
 }
 
 .preview-wrap {
@@ -404,6 +583,54 @@ body {
   background: var(--teal);
   color: #fff;
   justify-self: start;
+}
+
+.wait-status {
+  display: flex;
+  align-items: center;
+  gap: 0.55rem;
+  margin: 0.15rem 0 0;
+  color: var(--teal-dark);
+  font-weight: 600;
+}
+
+.wait-status[hidden] {
+  display: none !important;
+}
+
+.wait-dots {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.28rem;
+}
+
+.wait-dots span {
+  width: 0.42rem;
+  height: 0.42rem;
+  border-radius: 50%;
+  background: var(--teal);
+  animation: wait-dot 1s infinite ease-in-out;
+}
+
+.wait-dots span:nth-child(2) {
+  animation-delay: 0.16s;
+}
+
+.wait-dots span:nth-child(3) {
+  animation-delay: 0.32s;
+}
+
+@keyframes wait-dot {
+  0%,
+  80%,
+  100% {
+    opacity: 0.25;
+    transform: translateY(0);
+  }
+  40% {
+    opacity: 1;
+    transform: translateY(-4px);
+  }
 }
 
 .btn-primary:hover:not(:disabled) {
@@ -508,8 +735,8 @@ body {
   color: var(--err);
 }
 
-.actions {
-  white-space: nowrap;
+.members-table td.actions {
+  width: 15rem;
 }
 
 .empty {
@@ -524,6 +751,10 @@ body {
   }
 
   .actions .btn {
+    width: 100%;
+  }
+
+  .row-actions {
     width: 100%;
   }
 

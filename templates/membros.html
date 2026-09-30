@@ -34,6 +34,7 @@
         <tr>
           <th>Nome</th>
           <th>Matrícula</th>
+          <th>Piscina</th>
           <th>Exame válido até</th>
           <th>Status</th>
           <th></th>
@@ -44,10 +45,12 @@
         <tr
           data-name="{{ m.name|lower }}"
           data-reg="{{ m.registration|lower }}"
+          data-pool="{{ m.pool_label|lower }}"
           data-exam="{{ m.exam_filter }}"
         >
           <td>{{ m.name }}</td>
           <td class="mono">{{ m.registration }}</td>
+          <td>{{ m.pool_label }}</td>
           <td>{{ m.medical_exam_expires_at.strftime('%d/%m/%Y %H:%M') }}</td>
           <td><span class="badge {{ m.status_class }}">{{ m.status_label }}</span></td>
           <td class="actions">
@@ -82,8 +85,9 @@
     rows.forEach((row) => {
       const name = row.dataset.name || "";
       const reg = row.dataset.reg || "";
+      const pool = row.dataset.pool || "";
       const exam = row.dataset.exam || "";
-      const matchesSearch = !q || name.includes(q) || reg.includes(q);
+      const matchesSearch = !q || name.includes(q) || reg.includes(q) || pool.includes(q);
       const matchesFilter = activeFilter === "todos" || exam === activeFilter;
       const show = matchesSearch && matchesFilter;
       row.hidden = !show;

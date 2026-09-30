@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hmac
 import logging
 import uuid
 from datetime import datetime, timedelta
@@ -19,8 +20,18 @@ from flask import (
 from werkzeug.utils import secure_filename
 
 from app import db
-from app.config import PHOTOS_DIR, VALIDITY_DAYS, ensure_directories
-from app.intelbras_client import DeviceError, IntelbrasClient, public_media_url
+from app.config import (
+    PHOTOS_DIR,
+    VALIDITY_DAYS,
+    ensure_directories,
+    normalize_pool_ids,
+    pool_label,
+    registration_pools,
+    sync_settings,
+)
+from app.intelbras_client import DeviceError, DeviceFleet, fleet_for_pool, public_media_url
+from app.sync import build_state
+from app.tray import schedule_close_prompt
 
 logger = logging.getLogger(__name__)
 
@@ -28,10 +39,35 @@ bp = Blueprint("main", __name__)
 
 ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
 APP_TITLE = "Acesso Piscinas Clube Aliança"
+_ADM_TABS = {"socios", "vencimentos", "acessos"}
 
 
 def _allowed_file(filename: str) -> bool:
     return Path(filename).suffix.lower() in ALLOWED_EXTENSIONS
+
+
+def _redirect_adm(tab: str = "socios"):
+    if tab not in _ADM_TABS:
+        tab = "socios"
+    return redirect(url_for("main.adm") + f"#{tab}")
+
+
+def _redirect_after_member_action(default):
+    tab = (request.form.get("return_tab") or "").strip()
+    if tab in _ADM_TABS:
+        return _redirect_adm(tab)
+    return redirect(request.referrer or default)
+
+
+def _remove_member_photo(photo_path: Optional[str]) -> None:
+    if not photo_path:
+        return
+    path = Path(photo_path)
+    try:
+        if path.is_file():
+            path.unlink()
+    except OSError:
+        logger.warning("Não foi possível apagar a foto %s", path)
 
 
 def _wants_json() -> bool:
@@ -97,15 +133,15 @@ def _normalize_door_result(item: dict) -> str:
 
 
 def _sync_door_logs() -> int:
-    """Importa logs do equipamento para o banco local. Retorna quantos novos."""
+    """Importa logs de todos os faciais para o banco local. Retorna quantos novos."""
     try:
-        items = IntelbrasClient().list_door_logs(max_items=300)
+        items = DeviceFleet().list_door_logs(max_items=300)
     except Exception as exc:  # noqa: BLE001
         logger.warning("Sync de logs do XPE falhou: %s", exc)
         return 0
 
     added = 0
-    for item in items:
+    for prefix, item in items:
         if not isinstance(item, dict):
             continue
         name = (
@@ -126,17 +162,21 @@ def _sync_door_logs() -> int:
             or _parse_device_log_time(item.get("DateTime"))
             or datetime.now()
         )
-        external_id = str(
+        raw_external_id = str(
             item.get("ID")
             or item.get("LogID")
             or f"{registration}-{event_at.isoformat()}-{item.get('Status', '')}"
         )
+        external_id = f"{prefix}{raw_external_id}"
         result = _normalize_door_result(item)
+        detail = "Log do equipamento facial"
+        if prefix:
+            detail = f"Log do equipamento {prefix.rstrip(':')}"
         inserted = db.log_access_event(
             result=result,
             member_name=str(name) if name else None,
             registration=str(registration) if registration else None,
-            detail="Log do equipamento facial",
+            detail=detail,
             source="device",
             event_at=event_at,
             external_id=external_id,
@@ -159,6 +199,39 @@ def media(filename: str):
     return send_from_directory(PHOTOS_DIR, safe)
 
 
+def _sync_authorized() -> bool:
+    token = sync_settings().token
+    if not token:
+        return False
+    header = request.headers.get("Authorization", "")
+    supplied = header[7:].strip() if header.lower().startswith("bearer ") else ""
+    if not supplied:
+        supplied = (request.headers.get("X-Sync-Token") or "").strip()
+    if not supplied:
+        return False
+    return hmac.compare_digest(supplied, token)
+
+
+@bp.get("/sync/estado")
+def sync_estado():
+    if not _sync_authorized():
+        return jsonify({"ok": False, "error": "não autorizado"}), 401
+    return jsonify(build_state())
+
+
+@bp.get("/sync/foto/<path:filename>")
+def sync_foto(filename: str):
+    if not _sync_authorized():
+        return jsonify({"ok": False, "error": "não autorizado"}), 401
+    safe = Path(filename).name
+    if not safe or safe != filename or safe in {".", ".."}:
+        return jsonify({"ok": False, "error": "arquivo inválido"}), 400
+    ensure_directories()
+    if not (PHOTOS_DIR / safe).is_file():
+        return jsonify({"ok": False, "error": "foto não encontrada"}), 404
+    return send_from_directory(PHOTOS_DIR, safe)
+
+
 @bp.route("/cadastrar", methods=["GET", "POST"])
 def cadastrar():
     if request.method == "GET":
@@ -166,9 +239,11 @@ def cadastrar():
             "cadastrar.html",
             validity_days=VALIDITY_DAYS,
             app_title=APP_TITLE,
+            pools=registration_pools(),
         )
 
     name = (request.form.get("name") or "").strip()
+    pool = normalize_pool_ids(request.form.getlist("pool"))
     photo = request.files.get("photo")
 
     def fail(message: str, code: int = 400):
@@ -179,6 +254,9 @@ def cadastrar():
 
     if not name:
         return fail("Informe o nome da pessoa.")
+
+    if pool is None:
+        return fail("Selecione ao menos uma piscina: normal, térmica ou as duas.")
 
     if not photo or not photo.filename:
         return fail("Selecione uma foto.")
@@ -193,7 +271,7 @@ def cadastrar():
         return fail(f"Não foi possível salvar a foto: {exc}", 500)
 
     face_url = public_media_url(photo_path.name)
-    client = IntelbrasClient()
+    client = fleet_for_pool(pool)
     try:
         created = client.register_member(
             name,
@@ -207,6 +285,7 @@ def cadastrar():
             device_user_id=created.device_user_id,
             photo_path=str(photo_path),
             expires_at=expires_at,
+            pool=pool,
         )
     except DeviceError as exc:
         logger.exception("Falha no cadastro facial")
@@ -223,6 +302,7 @@ def cadastrar():
         f"{member.name} cadastrado(a) (matrícula {member.registration}). "
         f"Exame médico válido até "
         f"{member.medical_exam_expires_at.strftime('%d/%m/%Y %H:%M')}. "
+        f"Cadastro enviado para {pool_label(pool)}. "
         f"No XPE, abra Controle de Acesso → Usuários e busque pelo nome ou pela matrícula "
         f"{member.registration}."
     )
@@ -268,7 +348,7 @@ def renovar(member_id: int):
     if photo_path and photo_path.exists():
         face_url = public_media_url(photo_path.name)
 
-    client = IntelbrasClient()
+    client = fleet_for_pool(member.pool)
     try:
         created = client.renew_member(
             name=member.name,
@@ -285,14 +365,14 @@ def renovar(member_id: int):
     except DeviceError as exc:
         logger.exception("Falha ao renovar no equipamento")
         flash(f"Não foi possível renovar no equipamento: {exc}", "error")
-        return redirect(request.referrer or url_for("main.membros"))
+        return _redirect_after_member_action(url_for("main.membros"))
 
     flash(
         f"Exame médico de {updated.name} renovado até "
         f"{updated.medical_exam_expires_at.strftime('%d/%m/%Y %H:%M')}.",
         "success",
     )
-    return redirect(request.referrer or url_for("main.membros"))
+    return _redirect_after_member_action(url_for("main.membros"))
 
 
 @bp.get("/adm")
@@ -331,6 +411,10 @@ def adm():
         approved_events=db.list_access_events(limit=40, result="approved"),
         denied_events=db.list_access_events(limit=40, result="denied"),
         blocked_events=db.list_access_events(limit=40, result="blocked"),
+        change_events=db.list_access_events(
+            limit=40,
+            results=["registered", "renewed", "photo_updated", "deleted"],
+        ),
     )
 
 
@@ -339,9 +423,9 @@ def adm_bloquear(member_id: int):
     member = db.get_member(member_id)
     if member is None:
         flash("Membro não encontrado.", "error")
-        return redirect(url_for("main.adm"))
+        return _redirect_adm("socios")
 
-    client = IntelbrasClient()
+    client = fleet_for_pool(member.pool)
     try:
         if member.device_user_id is not None or member.registration:
             client.block_user(
@@ -352,10 +436,10 @@ def adm_bloquear(member_id: int):
     except DeviceError as exc:
         logger.exception("Falha ao bloquear no equipamento")
         flash(f"Não foi possível bloquear no equipamento: {exc}", "error")
-        return redirect(url_for("main.adm"))
+        return _redirect_adm("socios")
 
     flash(f"Acesso de {member.name} bloqueado.", "success")
-    return redirect(url_for("main.adm"))
+    return _redirect_adm("socios")
 
 
 @bp.post("/adm/membros/<int:member_id>/foto")
@@ -363,25 +447,25 @@ def adm_atualizar_foto(member_id: int):
     member = db.get_member(member_id)
     if member is None:
         flash("Membro não encontrado.", "error")
-        return redirect(url_for("main.adm"))
+        return _redirect_adm("socios")
 
     photo = request.files.get("photo")
     if not photo or not photo.filename:
         flash("Selecione uma nova foto.", "error")
-        return redirect(url_for("main.adm"))
+        return _redirect_adm("socios")
     if not _allowed_file(photo.filename):
         flash("Formato de foto inválido. Use JPG ou PNG.", "error")
-        return redirect(url_for("main.adm"))
+        return _redirect_adm("socios")
 
     try:
         photo_path = _save_upload(photo, member.name)
     except Exception as exc:
         logger.exception("Falha ao salvar nova foto")
         flash(f"Não foi possível salvar a foto: {exc}", "error")
-        return redirect(url_for("main.adm"))
+        return _redirect_adm("socios")
 
     face_url = public_media_url(photo_path.name)
-    client = IntelbrasClient()
+    client = fleet_for_pool(member.pool)
     try:
         if member.access_blocked or member.is_expired:
             db.update_member_photo(member_id, str(photo_path))
@@ -405,10 +489,10 @@ def adm_atualizar_foto(member_id: int):
         if photo_path.exists():
             photo_path.unlink(missing_ok=True)
         flash(f"Não foi possível atualizar a foto no equipamento: {exc}", "error")
-        return redirect(url_for("main.adm"))
+        return _redirect_adm("socios")
 
     flash(f"Foto de {member.name} atualizada.", "success")
-    return redirect(url_for("main.adm"))
+    return _redirect_adm("socios")
 
 
 @bp.post("/adm/sincronizar-logs")
@@ -421,17 +505,77 @@ def adm_sincronizar_logs():
         )
     except Exception as exc:  # noqa: BLE001
         flash(f"Falha ao sincronizar logs: {exc}", "error")
-    return redirect(url_for("main.adm"))
+    return _redirect_adm("acessos")
+
+
+@bp.post("/adm/membros/<int:member_id>/excluir")
+def adm_excluir(member_id: int):
+    member = db.get_member(member_id)
+    if member is None:
+        flash("Membro não encontrado.", "error")
+        return _redirect_adm("socios")
+
+    client = fleet_for_pool(member.pool)
+    try:
+        client.delete_user(
+            registration=member.registration,
+            device_user_id=member.device_user_id,
+        )
+    except DeviceError as exc:
+        logger.exception("Falha ao excluir no equipamento")
+        flash(
+            f"Não foi possível excluir no equipamento: {exc}. "
+            "O cadastro foi mantido.",
+            "error",
+        )
+        return _redirect_adm("socios")
+
+    db.log_access_event(
+        result="deleted",
+        member_name=member.name,
+        registration=member.registration,
+        detail="Cadastro excluído pelo ADM",
+    )
+    photo_path = member.photo_path
+    if not db.delete_member(member_id):
+        flash("Não foi possível apagar o cadastro local.", "error")
+        return _redirect_adm("socios")
+
+    _remove_member_photo(photo_path)
+    flash(f"Cadastro de {member.name} excluído.", "success")
+    return _redirect_adm("socios")
+
+
+@bp.post("/fechar-aba")
+def fechar_aba():
+    """A aba do navegador fechou. A confirmação aparece se nada reabrir."""
+    schedule_close_prompt()
+    return ("", 204)
 
 
 @bp.get("/saude")
 def saude():
-    status = {"app": "ok", "device": None, "error": None, "media_base": None}
+    status = {"app": "ok", "device": None, "devices": [], "error": None, "media_base": None}
     try:
-        info = IntelbrasClient().ping()
-        model = ((info.get("data") or {}).get("Status") or {}).get("Model")
-        status["device"] = model or "conectado"
+        devices = DeviceFleet().status()
+        status["devices"] = devices
         status["media_base"] = public_media_url("teste.jpg")
+        online = [item for item in devices if item.get("ok")]
+        if online and len(online) == len(devices):
+            status["device"] = ", ".join(
+                str(item.get("model") or item.get("url")) for item in online
+            )
+        elif online:
+            status["device"] = "parcial"
+            offline = [item for item in devices if not item.get("ok")]
+            status["error"] = "; ".join(
+                f"{item.get('url')}: {item.get('error')}" for item in offline
+            )
+        else:
+            status["device"] = "offline"
+            status["error"] = "; ".join(
+                f"{item.get('url')}: {item.get('error')}" for item in devices
+            )
     except Exception as exc:
         status["device"] = "offline"
         status["error"] = str(exc)

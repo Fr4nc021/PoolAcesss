@@ -5,6 +5,7 @@ import logging
 import tarfile
 import time
 import xml.etree.ElementTree as ET
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
@@ -17,12 +18,31 @@ from app.config import (
     DEVICE_LOGIN,
     DEVICE_PASSWORD,
     DEVICE_URL,
+    DOOR_NUM,
     PORT,
     SERVER_LAN_IP,
     VALIDITY_DAYS,
+    configured_device_urls,
+    registration_pools,
+    selected_pools,
 )
 
+# Agenda 1001 é a opção embutida "Sempre" do XPE. O número depois do hífen é o relé permitido.
+ALWAYS_SCHEDULE_RELAY = f"1001-{DOOR_NUM}"
+# Termo de validade na tela: 0 = Sempre, 1 = Nunca, 2 = Agenda.
+FACE_VALIDITY_ALWAYS = "0"
+
 logger = logging.getLogger(__name__)
+
+
+def _mark_face_always(key: ET.Element) -> None:
+    """Relé local permitido e termo de validade Sempre (não Agenda)."""
+    key.set("Relay", "1")
+    key.set("WebRelay", "0")
+    key.set("Validity", FACE_VALIDITY_ALWAYS)
+    key.set("Frequency", "0")
+    for child in list(key.findall("Schedule")):
+        key.remove(child)
 
 
 class DeviceError(Exception):
@@ -93,16 +113,6 @@ class IntelbrasClient:
                 return user
         return None
 
-    def _face_looks_ok(self, registration: str) -> bool:
-        user = self.find_user_by_registration(registration)
-        if not user:
-            return False
-        face_id = str(user.get("FaceID") or "")
-        status = user.get("FaceStatus")
-        return status in (1, "1") or (
-            "RegisterImg" in face_id and not face_id.endswith("/-1.jpg")
-        )
-
     def create_user_with_face(
         self,
         name: str,
@@ -110,11 +120,13 @@ class IntelbrasClient:
         *,
         registration: Optional[str] = None,
         face_public_url: Optional[str] = None,
+        image_ready: bool = False,
     ) -> CreatedUser:
+        _ = face_public_url
         reg = (registration or f"AP{int(time.time()) % 100000000:08d}")[:12]
-        jpeg_path = _ensure_jpeg_file(image_path)
+        jpeg_path = image_path if image_ready else _ensure_jpeg_file(image_path)
 
-        # 1) Cria usuário sem FaceUrl (evita rejeição no add)
+        # Cria usuário sem FaceUrl (evita rejeição no add)
         payload = {
             "target": "user",
             "action": "add",
@@ -123,8 +135,10 @@ class IntelbrasClient:
                     {
                         "Name": name.strip()[:60],
                         "UserID": reg,
+                        "ScheduleRelay": ALWAYS_SCHEDULE_RELAY,
                         "WebRelay": "0",
                         "LiftFloorNum": "9999",
+                        "Validity": FACE_VALIDITY_ALWAYS,
                     }
                 ]
             },
@@ -154,44 +168,22 @@ class IntelbrasClient:
             )
 
         device_id = int(user["ID"])
-        face_ok = False
+        face_ok = self._send_face(
+            registration=reg,
+            name=name,
+            jpeg_path=jpeg_path,
+            device_user_id=device_id,
+        )
 
-        # 2) Tenta face: base64 e depois URL pública do nosso app
-        for label, use_url in (("base64", False), ("url", True)):
-            if use_url and not face_public_url:
-                continue
-            try:
-                self.update_user(
-                    device_user_id=device_id,
-                    registration=reg,
-                    name=name,
-                    image_path=None if use_url else jpeg_path,
-                    face_public_url=face_public_url if use_url else None,
-                )
-                time.sleep(1.2)
-                if self._face_looks_ok(reg):
-                    face_ok = True
-                    logger.info("Face aceita via %s (reg=%s)", label, reg)
-                    break
-            except DeviceError as exc:
-                logger.warning("Tentativa de face (%s) falhou: %s", label, exc)
-
-        # 3) SEMPRE sincroniza via import TGZ — é o que faz o usuário aparecer
-        #    corretamente em Moradores/Usuário (Validity=0, Frequency=0, FaceID).
         try:
-            synced = self._attach_face_via_import(
-                registration=reg,
-                name=name.strip()[:60],
-                jpeg_path=jpeg_path,
+            self._grant_always_access(
                 device_user_id=device_id,
+                registration=reg,
+                name=name,
+                current=user,
             )
-            if synced:
-                face_ok = True
-                logger.info("Usuário sincronizado via import tgz (reg=%s)", reg)
-            else:
-                logger.warning("Import tgz concluiu, mas FaceStatus ainda não confirmou (reg=%s)", reg)
-        except Exception as exc:
-            logger.warning("Import de face/sincronização falhou: %s", exc)
+        except DeviceError as exc:
+            logger.warning("Relé permitido / validade sempre não confirmados: %s", exc)
 
         if not face_ok:
             logger.warning(
@@ -201,12 +193,44 @@ class IntelbrasClient:
                 reg,
             )
 
-        refreshed = self.find_user_by_registration(reg) or user
         return CreatedUser(
-            device_user_id=int(refreshed["ID"]),
+            device_user_id=device_id,
             registration=reg,
             face_ok=face_ok,
         )
+
+    def _send_face(
+        self,
+        *,
+        registration: str,
+        name: str,
+        jpeg_path: Path,
+        device_user_id: int,
+    ) -> bool:
+        """Grava a foto pelo import. Base64 só entra se o import falhar."""
+        try:
+            self._attach_face_via_import(
+                registration=registration,
+                name=name.strip()[:60],
+                jpeg_path=jpeg_path,
+                device_user_id=device_user_id,
+            )
+            logger.info("Usuário sincronizado via import tgz (reg=%s)", registration)
+            return True
+        except Exception as exc:  # noqa: BLE001 — tenta o envio direto em seguida
+            logger.warning("Import de face falhou, tentando base64: %s", exc)
+        try:
+            self.update_user(
+                device_user_id=device_user_id,
+                registration=registration,
+                name=name,
+                image_path=jpeg_path,
+            )
+            logger.info("Face enviada via base64 (reg=%s)", registration)
+            return True
+        except DeviceError as exc:
+            logger.warning("Tentativa de face (base64) falhou: %s", exc)
+            return False
 
     def _attach_face_via_import(
         self,
@@ -215,7 +239,7 @@ class IntelbrasClient:
         name: str,
         jpeg_path: Path,
         device_user_id: int,
-    ) -> bool:
+    ) -> None:
         jpeg_bytes = Path(jpeg_path).read_bytes()
         with self._client() as client:
             exported = client.get(self._url("/api/user/export"))
@@ -242,7 +266,7 @@ class IntelbrasClient:
 
         new_face = max_face + 1
         if target is None:
-            ET.SubElement(
+            target = ET.SubElement(
                 root,
                 "Key",
                 {
@@ -252,11 +276,7 @@ class IntelbrasClient:
                     "Name": name,
                     "Card": "",
                     "Pin": "",
-                    "Relay": "1",
-                    "WebRelay": "0",
                     "Floor": "9999",
-                    "Validity": "0",
-                    "Frequency": "0",
                     "Mon": "0",
                     "Tue": "0",
                     "Wed": "0",
@@ -271,11 +291,8 @@ class IntelbrasClient:
         else:
             target.set("FaceID", str(new_face))
             target.set("Name", name)
-            target.set("Validity", "0")
-            target.set("Frequency", "0")
-            target.set("Relay", target.get("Relay") or "1")
-            target.set("WebRelay", "0")
             target.set("Floor", target.get("Floor") or "9999")
+        _mark_face_always(target)
 
         new_xml = ET.tostring(root, encoding="utf-8", xml_declaration=True)
         out = BytesIO()
@@ -307,8 +324,36 @@ class IntelbrasClient:
             response.raise_for_status()
             self._check(response.json(), "user/import")
 
-        time.sleep(2.0)
-        return self._face_looks_ok(registration)
+    def _grant_always_access(
+        self,
+        *,
+        device_user_id: int,
+        registration: str,
+        name: Optional[str] = None,
+        current: Optional[dict[str, Any]] = None,
+    ) -> None:
+        """Seleciona relé permitido e termo de validade Sempre."""
+        known = current if current is not None else (self.find_user_by_registration(registration) or {})
+        item: dict[str, Any] = {
+            "ID": str(known.get("ID") or device_user_id),
+            "UserID": registration,
+            "ScheduleRelay": ALWAYS_SCHEDULE_RELAY,
+            "WebRelay": "0",
+            "LiftFloorNum": "9999",
+            "Validity": FACE_VALIDITY_ALWAYS,
+        }
+        resolved_name = (name or str(known.get("Name") or "")).strip()
+        if resolved_name:
+            item["Name"] = resolved_name[:60]
+
+        payload = {"target": "user", "action": "set", "data": {"item": [item]}}
+        try:
+            with self._client() as client:
+                response = client.post(self._url("/api/user/set"), json=payload)
+                response.raise_for_status()
+                self._check(response.json(), "user/set acesso")
+        except httpx.HTTPError as exc:
+            raise DeviceError(f"Falha ao liberar relé e validade sempre: {exc}") from exc
 
     def update_user(
         self,
@@ -322,8 +367,10 @@ class IntelbrasClient:
         item: dict[str, Any] = {
             "ID": str(device_user_id),
             "UserID": registration,
+            "ScheduleRelay": ALWAYS_SCHEDULE_RELAY,
             "WebRelay": "0",
             "LiftFloorNum": "9999",
+            "Validity": FACE_VALIDITY_ALWAYS,
         }
         if name:
             item["Name"] = name.strip()[:60]
@@ -430,40 +477,36 @@ class IntelbrasClient:
         face_public_url: Optional[str] = None,
     ) -> CreatedUser:
         """Atualiza a foto facial de um membro já cadastrado (ou recria se sumiu)."""
-        self.ping()
+        _ = face_public_url
         jpeg_path = _ensure_jpeg_file(image_path)
         existing = self.find_user_by_registration(registration)
         if existing:
             device_id = int(existing["ID"])
+            face_ok = self._send_face(
+                registration=registration,
+                name=name,
+                jpeg_path=jpeg_path,
+                device_user_id=device_id,
+            )
             try:
-                self.update_user(
+                self._grant_always_access(
                     device_user_id=device_id,
                     registration=registration,
                     name=name,
-                    image_path=jpeg_path,
-                    face_public_url=face_public_url,
+                    current=existing,
                 )
             except DeviceError as exc:
-                logger.warning("update_user na troca de foto falhou: %s", exc)
-            try:
-                self._attach_face_via_import(
-                    registration=registration,
-                    name=name.strip()[:60],
-                    jpeg_path=jpeg_path,
-                    device_user_id=device_id,
-                )
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("Import na troca de foto falhou: %s", exc)
+                logger.warning("Relé permitido / validade sempre não confirmados: %s", exc)
             return CreatedUser(
                 device_user_id=device_id,
                 registration=registration,
-                face_ok=self._face_looks_ok(registration),
+                face_ok=face_ok,
             )
         return self.create_user_with_face(
             name,
             jpeg_path,
             registration=registration,
-            face_public_url=face_public_url,
+            image_ready=True,
         )
 
     def register_member(
@@ -474,14 +517,15 @@ class IntelbrasClient:
         registration: Optional[str] = None,
         validity_days: int = VALIDITY_DAYS,
         face_public_url: Optional[str] = None,
+        image_ready: bool = False,
     ) -> CreatedUser:
         _ = validity_days
-        self.ping()
         return self.create_user_with_face(
             name,
             image_path,
             registration=registration,
             face_public_url=face_public_url,
+            image_ready=image_ready,
         )
 
     def renew_member(
@@ -504,6 +548,15 @@ class IntelbrasClient:
                     image_path=image_path,
                     face_public_url=face_public_url,
                 )
+            try:
+                self._grant_always_access(
+                    device_user_id=int(existing["ID"]),
+                    registration=registration,
+                    name=name,
+                    current=existing,
+                )
+            except DeviceError as exc:
+                logger.warning("Relé permitido / validade sempre não confirmados: %s", exc)
             return CreatedUser(
                 device_user_id=int(existing["ID"]),
                 registration=registration,
@@ -525,6 +578,226 @@ class IntelbrasClient:
             registration=registration,
             face_public_url=face_public_url,
         )
+
+
+def device_clients() -> list[IntelbrasClient]:
+    urls = configured_device_urls()
+    if not urls:
+        return [IntelbrasClient()]
+    return [IntelbrasClient(base_url=url) for url in urls]
+
+
+def fleet_for_pool(pool: Optional[str]) -> DeviceFleet:
+    """Uma piscina vai para o facial dela. As duas, ou cadastro antigo, vão para os dois."""
+    chosen = selected_pools(pool)
+    if not chosen or len(chosen) >= len(registration_pools()):
+        return DeviceFleet()
+    return DeviceFleet([IntelbrasClient(base_url=chosen[0]["url"])])
+
+
+class DeviceFleet:
+    """Envia o mesmo cadastro para todos os faciais configurados."""
+
+    def __init__(self, clients: Optional[list[IntelbrasClient]] = None) -> None:
+        self.clients = clients if clients is not None else device_clients()
+
+    def _label(self, client: IntelbrasClient) -> str:
+        return client.base_url or "equipamento"
+
+    def status(self) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        for client in self.clients:
+            try:
+                info = client.ping()
+                model = ((info.get("data") or {}).get("Status") or {}).get("Model")
+                rows.append(
+                    {
+                        "url": client.base_url,
+                        "ok": True,
+                        "model": model or "conectado",
+                    }
+                )
+            except DeviceError as exc:
+                rows.append(
+                    {
+                        "url": client.base_url,
+                        "ok": False,
+                        "model": None,
+                        "error": str(exc),
+                    }
+                )
+        return rows
+
+    def register_member(
+        self,
+        name: str,
+        image_path: Path,
+        *,
+        registration: Optional[str] = None,
+        validity_days: int = VALIDITY_DAYS,
+        face_public_url: Optional[str] = None,
+    ) -> CreatedUser:
+        if not self.clients:
+            raise DeviceError("Nenhum facial configurado (DEVICE_URL).")
+
+        shared_registration = (registration or f"AP{int(time.time()) % 100000000:08d}")[:12]
+        jpeg_path = _ensure_jpeg_file(image_path)
+        targets = ", ".join(self._label(client) for client in self.clients)
+        print(f"Cadastrando em: {targets}", flush=True)
+
+        def _send(client: IntelbrasClient) -> CreatedUser:
+            print(f"Enviando cadastro para {self._label(client)} ...", flush=True)
+            try:
+                result = client.register_member(
+                    name,
+                    jpeg_path,
+                    registration=shared_registration,
+                    validity_days=validity_days,
+                    face_public_url=face_public_url,
+                    image_ready=True,
+                )
+            except DeviceError as exc:
+                print(f"Falhou em {self._label(client)}: {exc}", flush=True)
+                raise DeviceError(f"{self._label(client)}: {exc}") from exc
+            print(f"Cadastro aceito em {self._label(client)}", flush=True)
+            return result
+
+        results: dict[int, CreatedUser] = {}
+        errors: list[str] = []
+        try:
+            with ThreadPoolExecutor(max_workers=max(1, len(self.clients))) as pool:
+                futures = {
+                    pool.submit(_send, client): index
+                    for index, client in enumerate(self.clients)
+                }
+                for future in as_completed(futures):
+                    index = futures[future]
+                    try:
+                        results[index] = future.result()
+                    except Exception as exc:  # noqa: BLE001 — um aparelho não pode abortar o outro
+                        errors.append(str(exc))
+            if errors:
+                raise DeviceError("; ".join(errors))
+        except DeviceError:
+            for client in self.clients:
+                try:
+                    client.delete_user(registration=shared_registration)
+                except DeviceError as exc:
+                    logger.warning(
+                        "Rollback do cadastro falhou em %s: %s",
+                        client.base_url,
+                        exc,
+                    )
+            raise
+
+        created = results.get(0)
+        if created is None:
+            raise DeviceError("Nenhum facial recebeu o cadastro.")
+        if any(not item.face_ok for item in results.values()):
+            created.face_ok = False
+        return created
+
+    def renew_member(
+        self,
+        *,
+        name: str,
+        registration: str,
+        image_path: Optional[Path],
+        previous_device_user_id: Optional[int] = None,
+        face_public_url: Optional[str] = None,
+    ) -> CreatedUser:
+        return self._map_user(
+            "renovar",
+            lambda client: client.renew_member(
+                name=name,
+                registration=registration,
+                image_path=image_path,
+                previous_device_user_id=previous_device_user_id,
+                face_public_url=face_public_url,
+            ),
+        )
+
+    def update_member_face(
+        self,
+        *,
+        name: str,
+        registration: str,
+        image_path: Path,
+        face_public_url: Optional[str] = None,
+    ) -> CreatedUser:
+        return self._map_user(
+            "atualizar a foto",
+            lambda client: client.update_member_face(
+                name=name,
+                registration=registration,
+                image_path=image_path,
+                face_public_url=face_public_url,
+            ),
+        )
+
+    def block_user(self, device_user_id: int, registration: Optional[str] = None) -> None:
+        errors: list[str] = []
+        for client in self.clients:
+            try:
+                client.block_user(
+                    device_user_id=device_user_id,
+                    registration=registration,
+                )
+            except DeviceError as exc:
+                errors.append(f"{self._label(client)}: {exc}")
+        if errors:
+            raise DeviceError("Falha ao bloquear em " + "; ".join(errors))
+
+    def delete_user(
+        self,
+        *,
+        registration: Optional[str] = None,
+        device_user_id: Optional[int] = None,
+    ) -> None:
+        errors: list[str] = []
+        for client in self.clients:
+            try:
+                client.delete_user(
+                    registration=registration,
+                    device_user_id=device_user_id,
+                )
+            except DeviceError as exc:
+                errors.append(f"{self._label(client)}: {exc}")
+        if errors:
+            raise DeviceError("Falha ao excluir em " + "; ".join(errors))
+
+    def list_door_logs(self, *, max_items: int = 200) -> list[tuple[str, dict[str, Any]]]:
+        """Logs de cada facial. O prefixo evita colisão de ID entre aparelhos."""
+        merged: list[tuple[str, dict[str, Any]]] = []
+        for index, client in enumerate(self.clients):
+            try:
+                items = client.list_door_logs(max_items=max_items)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Sync de logs falhou em %s: %s", client.base_url, exc)
+                continue
+            prefix = "" if index == 0 else f"{self._label(client)}:"
+            for item in items:
+                merged.append((prefix, item))
+        return merged
+
+    def _map_user(self, action: str, fn) -> CreatedUser:
+        created: Optional[CreatedUser] = None
+        errors: list[str] = []
+        for client in self.clients:
+            try:
+                result = fn(client)
+            except DeviceError as exc:
+                errors.append(f"{self._label(client)}: {exc}")
+                continue
+            if created is None:
+                created = result
+            elif not result.face_ok:
+                created.face_ok = False
+        if errors:
+            raise DeviceError(f"Falha ao {action} em " + "; ".join(errors))
+        if created is None:
+            raise DeviceError(f"Nenhum facial respondeu ao pedido de {action}.")
+        return created
 
 
 def public_media_url(filename: str) -> str:

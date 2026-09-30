@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import hashlib
 import sqlite3
+import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Iterator, Optional
 
-from app.config import DB_PATH, VALIDITY_DAYS, ensure_directories
+from app.config import DB_PATH, VALIDITY_DAYS, ensure_directories, pool_label
 
 
 def _connect() -> sqlite3.Connection:
@@ -14,6 +17,7 @@ def _connect() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute("PRAGMA journal_mode = WAL")
     return conn
 
 
@@ -81,6 +85,73 @@ def init_db() -> None:
             WHERE external_id IS NOT NULL
             """
         )
+        _ensure_column(conn, "members", "photo_sha256", "TEXT")
+        _ensure_column(conn, "members", "device_pending", "TEXT")
+        _ensure_column(conn, "members", "pool", "TEXT")
+        _ensure_column(conn, "access_events", "sync_id", "TEXT")
+        conn.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_access_events_sync
+            ON access_events(sync_id)
+            WHERE sync_id IS NOT NULL
+            """
+        )
+        _backfill_photo_hashes(conn)
+        _backfill_event_sync_ids(conn)
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS member_deletions (
+                registration TEXT PRIMARY KEY,
+                deleted_at TEXT NOT NULL
+            )
+            """
+        )
+
+
+def _ensure_column(conn: sqlite3.Connection, table: str, column: str, ddl: str) -> None:
+    existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+    if column not in existing:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
+
+
+def file_sha256(path: Optional[str]) -> Optional[str]:
+    if not path:
+        return None
+    file = Path(path)
+    if not file.is_file():
+        return None
+    digest = hashlib.sha256()
+    with file.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _backfill_photo_hashes(conn: sqlite3.Connection) -> None:
+    rows = conn.execute(
+        """
+        SELECT id, photo_path FROM members
+        WHERE photo_sha256 IS NULL AND photo_path IS NOT NULL
+        """
+    ).fetchall()
+    for row in rows:
+        digest = file_sha256(row["photo_path"])
+        if digest:
+            conn.execute(
+                "UPDATE members SET photo_sha256 = ? WHERE id = ?",
+                (digest, row["id"]),
+            )
+
+
+def _backfill_event_sync_ids(conn: sqlite3.Connection) -> None:
+    rows = conn.execute(
+        "SELECT id FROM access_events WHERE sync_id IS NULL"
+    ).fetchall()
+    for row in rows:
+        conn.execute(
+            "UPDATE access_events SET sync_id = ? WHERE id = ?",
+            (str(uuid.uuid4()), row["id"]),
+        )
 
 
 @dataclass
@@ -90,10 +161,17 @@ class Member:
     registration: str
     device_user_id: Optional[int]
     photo_path: Optional[str]
+    photo_sha256: Optional[str]
     medical_exam_expires_at: datetime
     access_blocked: bool
     created_at: datetime
     updated_at: datetime
+    device_pending: Optional[str] = None
+    pool: Optional[str] = None
+
+    @property
+    def pool_label(self) -> str:
+        return pool_label(self.pool)
 
     @property
     def is_expired(self) -> bool:
@@ -140,6 +218,9 @@ class AccessEvent:
     result: str
     source: str
     detail: Optional[str]
+    sync_id: Optional[str] = None
+    external_id: Optional[str] = None
+    created_at: Optional[datetime] = None
 
     @property
     def result_label(self) -> str:
@@ -150,6 +231,8 @@ class AccessEvent:
             "renewed": "Renovado",
             "registered": "Cadastrado",
             "photo_updated": "Foto atualizada",
+            "deleted": "Excluído",
+            "deleted": "Excluído",
         }
         return mapping.get(self.result, self.result)
 
@@ -157,7 +240,7 @@ class AccessEvent:
     def result_class(self) -> str:
         if self.result in {"approved", "renewed", "registered", "photo_updated"}:
             return "status-ok"
-        if self.result in {"denied", "blocked"}:
+        if self.result in {"denied", "blocked", "deleted"}:
             return "status-expired"
         return "status-warning"
 
@@ -167,20 +250,26 @@ def _parse_dt(value: str) -> datetime:
 
 
 def _row_to_member(row: sqlite3.Row) -> Member:
+    keys = row.keys()
     return Member(
         id=row["id"],
         name=row["name"],
         registration=row["registration"],
         device_user_id=row["device_user_id"],
         photo_path=row["photo_path"],
+        photo_sha256=row["photo_sha256"] if "photo_sha256" in keys else None,
         medical_exam_expires_at=_parse_dt(row["medical_exam_expires_at"]),
         access_blocked=bool(row["access_blocked"]),
         created_at=_parse_dt(row["created_at"]),
         updated_at=_parse_dt(row["updated_at"]),
+        device_pending=row["device_pending"] if "device_pending" in keys else None,
+        pool=row["pool"] if "pool" in keys else None,
     )
 
 
 def _row_to_event(row: sqlite3.Row) -> AccessEvent:
+    keys = row.keys()
+    created = row["created_at"] if "created_at" in keys else None
     return AccessEvent(
         id=row["id"],
         event_at=_parse_dt(row["event_at"]),
@@ -189,6 +278,9 @@ def _row_to_event(row: sqlite3.Row) -> AccessEvent:
         result=row["result"],
         source=row["source"],
         detail=row["detail"],
+        sync_id=row["sync_id"] if "sync_id" in keys else None,
+        external_id=row["external_id"] if "external_id" in keys else None,
+        created_at=_parse_dt(created) if created else None,
     )
 
 
@@ -199,25 +291,30 @@ def create_member(
     device_user_id: int,
     photo_path: Optional[str],
     expires_at: Optional[datetime] = None,
+    pool: Optional[str] = None,
 ) -> Member:
     now = datetime.now()
     expires = expires_at or (now + timedelta(days=VALIDITY_DAYS))
+    digest = file_sha256(photo_path)
     with get_connection() as conn:
         cur = conn.execute(
             """
             INSERT INTO members (
-                name, registration, device_user_id, photo_path,
-                medical_exam_expires_at, access_blocked, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, 0, ?, ?)
+                name, registration, device_user_id, photo_path, photo_sha256,
+                medical_exam_expires_at, access_blocked, created_at, updated_at,
+                pool
+            ) VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?)
             """,
             (
                 name.strip(),
                 registration,
                 device_user_id,
                 photo_path,
+                digest,
                 expires.isoformat(timespec="seconds"),
                 now.isoformat(timespec="seconds"),
                 now.isoformat(timespec="seconds"),
+                pool,
             ),
         )
         member_id = cur.lastrowid
@@ -236,6 +333,14 @@ def get_member(member_id: int) -> Optional[Member]:
     with get_connection() as conn:
         row = conn.execute(
             "SELECT * FROM members WHERE id = ?", (member_id,)
+        ).fetchone()
+    return _row_to_member(row) if row else None
+
+
+def get_member_by_registration(registration: str) -> Optional[Member]:
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT * FROM members WHERE registration = ?", (registration,)
         ).fetchone()
     return _row_to_member(row) if row else None
 
@@ -305,14 +410,15 @@ def list_expired_members() -> list[Member]:
 
 def update_member_photo(member_id: int, photo_path: str) -> Optional[Member]:
     now = datetime.now()
+    digest = file_sha256(photo_path)
     with get_connection() as conn:
         cur = conn.execute(
             """
             UPDATE members
-            SET photo_path = ?, updated_at = ?
+            SET photo_path = ?, photo_sha256 = ?, updated_at = ?
             WHERE id = ?
             """,
-            (photo_path, now.isoformat(timespec="seconds"), member_id),
+            (photo_path, digest, now.isoformat(timespec="seconds"), member_id),
         )
         if cur.rowcount == 0:
             return None
@@ -363,6 +469,86 @@ def renew_member(member_id: int, expires_at: Optional[datetime] = None) -> Optio
     return member
 
 
+def delete_member(member_id: int) -> bool:
+    now = datetime.now()
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT registration FROM members WHERE id = ?",
+            (member_id,),
+        ).fetchone()
+        if row is None:
+            return False
+        _record_deletion(conn, row["registration"], now)
+        cur = conn.execute("DELETE FROM members WHERE id = ?", (member_id,))
+        return cur.rowcount > 0
+
+
+def record_deletion(registration: str, deleted_at: datetime) -> None:
+    """Guarda a exclusão e tira o sócio local se a exclusão for a versão mais nova."""
+    photo: Optional[str] = None
+    with get_connection() as conn:
+        _record_deletion(conn, registration, deleted_at)
+        current = conn.execute(
+            "SELECT photo_path, updated_at FROM members WHERE registration = ?",
+            (registration,),
+        ).fetchone()
+        if current is None:
+            return
+        if _parse_dt(current["updated_at"]) <= deleted_at.replace(microsecond=0):
+            photo = current["photo_path"]
+            conn.execute(
+                "DELETE FROM members WHERE registration = ?",
+                (registration,),
+            )
+    if photo:
+        path = Path(photo)
+        if path.is_file():
+            path.unlink(missing_ok=True)
+
+
+def clear_deletion(registration: str) -> None:
+    with get_connection() as conn:
+        conn.execute(
+            "DELETE FROM member_deletions WHERE registration = ?",
+            (registration,),
+        )
+
+
+def get_deletion(registration: str) -> Optional[datetime]:
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT deleted_at FROM member_deletions WHERE registration = ?",
+            (registration,),
+        ).fetchone()
+    return _parse_dt(row["deleted_at"]) if row else None
+
+
+def list_deletions() -> list[tuple[str, datetime]]:
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT registration, deleted_at FROM member_deletions ORDER BY registration"
+        ).fetchall()
+    return [(row["registration"], _parse_dt(row["deleted_at"])) for row in rows]
+
+
+def _record_deletion(conn: sqlite3.Connection, registration: str, deleted_at: datetime) -> None:
+    stamp = deleted_at.replace(microsecond=0).isoformat(timespec="seconds")
+    row = conn.execute(
+        "SELECT deleted_at FROM member_deletions WHERE registration = ?",
+        (registration,),
+    ).fetchone()
+    if row is not None and _parse_dt(row["deleted_at"]) >= deleted_at.replace(microsecond=0):
+        return
+    conn.execute(
+        """
+        INSERT INTO member_deletions (registration, deleted_at)
+        VALUES (?, ?)
+        ON CONFLICT(registration) DO UPDATE SET deleted_at = excluded.deleted_at
+        """,
+        (registration, stamp),
+    )
+
+
 def mark_blocked(member_id: int) -> None:
     now = datetime.now()
     with get_connection() as conn:
@@ -408,10 +594,13 @@ def log_access_event(
     source: str = "local",
     event_at: Optional[datetime] = None,
     external_id: Optional[str] = None,
+    sync_id: Optional[str] = None,
+    created_at: Optional[datetime] = None,
 ) -> bool:
-    """Registra evento. Retorna False se external_id já existia."""
-    now = datetime.now()
+    """Registra evento. Retorna False se external_id ou sync_id já existia."""
+    now = created_at or datetime.now()
     when = event_at or now
+    event_sync_id = sync_id or str(uuid.uuid4())
     with get_connection() as conn:
         if external_id:
             existing = conn.execute(
@@ -420,12 +609,18 @@ def log_access_event(
             ).fetchone()
             if existing:
                 return False
+        existing_sync = conn.execute(
+            "SELECT id FROM access_events WHERE sync_id = ?",
+            (event_sync_id,),
+        ).fetchone()
+        if existing_sync:
+            return False
         conn.execute(
             """
             INSERT INTO access_events (
                 event_at, member_name, registration, result,
-                source, detail, external_id, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                source, detail, external_id, created_at, sync_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 when.isoformat(timespec="seconds"),
@@ -436,15 +631,145 @@ def log_access_event(
                 detail,
                 external_id,
                 now.isoformat(timespec="seconds"),
+                event_sync_id,
             ),
         )
     return True
+
+
+def list_events_for_sync() -> list[AccessEvent]:
+    with get_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT * FROM access_events
+            WHERE sync_id IS NOT NULL
+            ORDER BY event_at ASC, id ASC
+            """
+        ).fetchall()
+    return [_row_to_event(row) for row in rows]
+
+
+def upsert_synced_member(
+    *,
+    name: str,
+    registration: str,
+    device_user_id: Optional[int],
+    photo_path: Optional[str],
+    photo_sha256: Optional[str],
+    expires_at: datetime,
+    access_blocked: bool,
+    created_at: datetime,
+    updated_at: datetime,
+    mark_unblock_pending: bool,
+    pool: Optional[str] = None,
+) -> Member:
+    """Grava a junção pela matrícula sem criar evento nem falar com o facial."""
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT id, device_pending FROM members WHERE registration = ?",
+            (registration,),
+        ).fetchone()
+        pending = None
+        if row is not None and row["device_pending"]:
+            pending = row["device_pending"]
+        if mark_unblock_pending:
+            pending = "unblock"
+        conn.execute(
+            "DELETE FROM member_deletions WHERE registration = ?",
+            (registration,),
+        )
+        values = (
+            name.strip(),
+            device_user_id,
+            photo_path,
+            photo_sha256,
+            expires_at.isoformat(timespec="seconds"),
+            1 if access_blocked else 0,
+            created_at.isoformat(timespec="seconds"),
+            updated_at.isoformat(timespec="seconds"),
+            pending,
+            pool,
+            registration,
+        )
+        if row is None:
+            conn.execute(
+                """
+                INSERT INTO members (
+                    name, registration, device_user_id, photo_path, photo_sha256,
+                    medical_exam_expires_at, access_blocked, created_at, updated_at,
+                    device_pending, pool
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    name.strip(),
+                    registration,
+                    device_user_id,
+                    photo_path,
+                    photo_sha256,
+                    expires_at.isoformat(timespec="seconds"),
+                    1 if access_blocked else 0,
+                    created_at.isoformat(timespec="seconds"),
+                    updated_at.isoformat(timespec="seconds"),
+                    pending,
+                    pool,
+                ),
+            )
+        else:
+            conn.execute(
+                """
+                UPDATE members
+                SET name = ?,
+                    device_user_id = ?,
+                    photo_path = ?,
+                    photo_sha256 = ?,
+                    medical_exam_expires_at = ?,
+                    access_blocked = ?,
+                    created_at = ?,
+                    updated_at = ?,
+                    device_pending = ?,
+                    pool = ?
+                WHERE registration = ?
+                """,
+                values,
+            )
+    member = get_member_by_registration(registration)
+    assert member is not None
+    return member
+
+
+def list_unblock_pending() -> list[Member]:
+    with get_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT * FROM members
+            WHERE device_pending = 'unblock'
+            ORDER BY registration
+            """
+        ).fetchall()
+    return [_row_to_member(row) for row in rows]
+
+
+def clear_device_pending(member_id: int) -> None:
+    with get_connection() as conn:
+        conn.execute(
+            "UPDATE members SET device_pending = NULL WHERE id = ?",
+            (member_id,),
+        )
+
+
+def set_photo_sha256(member_id: int, digest: str) -> None:
+    with get_connection() as conn:
+        conn.execute(
+            "UPDATE members SET photo_sha256 = ? WHERE id = ?",
+            (digest, member_id),
+        )
 
 
 def list_access_events(
     *,
     limit: int = 100,
     result: Optional[str] = None,
+    results: Optional[list[str]] = None,
     since: Optional[datetime] = None,
 ) -> list[AccessEvent]:
     clauses: list[str] = []
@@ -452,6 +777,10 @@ def list_access_events(
     if result:
         clauses.append("result = ?")
         params.append(result)
+    elif results:
+        placeholders = ", ".join("?" for _ in results)
+        clauses.append(f"result IN ({placeholders})")
+        params.extend(results)
     if since:
         clauses.append("event_at >= ?")
         params.append(since.isoformat(timespec="seconds"))
