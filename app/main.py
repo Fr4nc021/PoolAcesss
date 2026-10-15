@@ -22,6 +22,10 @@ from app.expiry import start_expiry_worker
 from app.routes import bp
 from app.shortcut import ensure_desktop_shortcut
 from app.sync import start_sync_worker, status_view
+from app.updater import last_result as update_result
+from app.updater import start_update_worker
+from app.updater import status as update_status
+from app.version import VERSION
 from app.tray import (
     cancel_close_prompt,
     hide_console,
@@ -59,7 +63,13 @@ def create_app() -> Flask:
 
     @app.context_processor
     def _inject_sync_status():
-        return {"sync_status": status_view()}
+        return {
+            "sync_status": status_view(),
+            "update_status": update_status(),
+            "update_result": update_result(),
+            "app_version": VERSION,
+            "is_local_request": request.remote_addr in {"127.0.0.1", "::1"},
+        }
 
     return app
 
@@ -78,6 +88,7 @@ def main() -> None:
     start_tray()
     start_expiry_worker()
     start_sync_worker()
+    start_update_worker()
     devices = ", ".join(configured_device_urls()) or "(nenhum facial configurado)"
     sync = sync_settings()
     peer = sync.peer_url or "(não configurado)"
@@ -86,7 +97,7 @@ def main() -> None:
     if on_chromeos() and host in {"127.0.0.1", "localhost", ""}:
         host = "0.0.0.0"
     print("=" * 50)
-    print(" Acesso Piscinas Clube Aliança")
+    print(f" Acesso Piscinas Clube Aliança — versão {VERSION}")
     print(f" Neste PC:   http://127.0.0.1:{PORT}")
     print(f" Na rede:    http://{SERVER_LAN_IP}:{PORT}")
     print(f" Faciais:    {devices}")

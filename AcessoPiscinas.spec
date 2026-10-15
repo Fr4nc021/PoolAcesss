@@ -7,7 +7,7 @@ datas = [
     ('assets/aquaaccess.ico', '.'),
 ]
 binaries = []
-hiddenimports = ['app', 'app.main', 'app.routes', 'app.db', 'app.config', 'app.expiry', 'app.intelbras_client', 'app.shortcut', 'app.tray', 'pystray', 'pystray._win32']
+hiddenimports = ['app', 'app.main', 'app.routes', 'app.db', 'app.config', 'app.expiry', 'app.intelbras_client', 'app.shortcut', 'app.tray', 'app.sync', 'app.updater', 'app.update_core', 'app.update_key', 'app.version', 'pystray', 'pystray._win32']
 
 tmp_ret = collect_all('flask')
 datas += tmp_ret[0]

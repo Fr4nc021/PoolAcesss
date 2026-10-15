@@ -28,6 +28,23 @@
       </p>
     </header>
 
+    {% if update_result and not update_result.ok %}
+      <div class="flash flash-error" role="alert">{{ update_result.message }}</div>
+    {% endif %}
+    <div
+      id="update-banner"
+      class="update-banner"
+      role="status"
+      {% if update_status.state != "ready" %}hidden{% endif %}
+    >
+      <span id="update-text">Versão {{ update_status.available }} pronta para instalar.</span>
+      {% if is_local_request %}
+        <button type="button" class="btn btn-primary" id="btn-update-install">Instalar</button>
+      {% else %}
+        <span class="update-hint">Instale pelo PC onde o programa está aberto.</span>
+      {% endif %}
+    </div>
+
     {% with messages = get_flashed_messages(with_categories=true) %}
       {% if messages %}
         <div class="flash-list">
@@ -41,7 +58,73 @@
     <main class="main">
       {% block content %}{% endblock %}
     </main>
+
+    <footer class="app-footer">
+      <span>Versão {{ app_version }}</span>
+      {% if update_result and update_result.ok %}
+        <span class="is-ok">{{ update_result.message }}</span>
+      {% endif %}
+      {% if is_local_request and update_status.state != "disabled" %}
+        <button type="button" class="btn btn-secondary btn-sm" id="btn-update-check">Procurar atualização</button>
+      {% endif %}
+      <span id="update-message">{% if update_status.state in ["error", "current", "downloading", "checking"] %}{{ update_status.message }}{% endif %}</span>
+    </footer>
   </div>
+  <script>
+    (function () {
+      const headers = { Accept: "application/json", "X-Acesso-Local": "1" };
+      const banner = document.getElementById("update-banner");
+      const text = document.getElementById("update-text");
+      const message = document.getElementById("update-message");
+      const installBtn = document.getElementById("btn-update-install");
+      const checkBtn = document.getElementById("btn-update-check");
+
+      function show(state) {
+        if (state.state === "ready") {
+          text.textContent = "Versão " + state.available + " pronta para instalar.";
+          banner.hidden = false;
+        }
+        if (message && state.message && state.state !== "ready") {
+          message.textContent = state.message;
+        }
+      }
+
+      if (checkBtn) {
+        checkBtn.addEventListener("click", async function () {
+          checkBtn.disabled = true;
+          message.textContent = "Procurando versão nova...";
+          try {
+            const response = await fetch("/atualizacao/verificar", { method: "POST", headers });
+            const data = await response.json();
+            if (!data.ok) message.textContent = data.error || "Não foi possível procurar.";
+            else show(data);
+          } catch (_) {
+            message.textContent = "Não foi possível procurar atualização.";
+          }
+          checkBtn.disabled = false;
+        });
+      }
+
+      if (installBtn) {
+        installBtn.addEventListener("click", async function () {
+          if (!window.confirm(
+            "Instalar a versão nova agora? O programa fecha, troca os arquivos e abre de novo sozinho. Cadastros e fotos não são apagados."
+          )) return;
+          installBtn.disabled = true;
+          try {
+            const response = await fetch("/atualizacao/instalar", { method: "POST", headers });
+            const data = await response.json();
+            text.textContent = data.ok ? data.message : data.error;
+            if (!data.ok) installBtn.disabled = false;
+            else if (window.__acessoStay) window.__acessoStay();
+          } catch (_) {
+            text.textContent = "Não foi possível iniciar a instalação.";
+            installBtn.disabled = false;
+          }
+        });
+      }
+    })();
+  </script>
   <script>
     (function () {
       let navegandoPorDentro = false;

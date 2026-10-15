@@ -4,6 +4,7 @@ import hmac
 import logging
 import uuid
 from datetime import datetime, timedelta
+from functools import wraps
 from pathlib import Path
 from typing import Optional
 
@@ -30,8 +31,11 @@ from app.config import (
     sync_settings,
 )
 from app.intelbras_client import DeviceError, DeviceFleet, fleet_for_pool, public_media_url
+from app import updater
 from app.sync import build_state, request_sync, run_sync_cycle, status_view
 from app.tray import schedule_close_prompt
+from app.update_core import UpdateError
+from app.version import VERSION
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +44,44 @@ bp = Blueprint("main", __name__)
 ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
 APP_TITLE = "Acesso Piscinas Clube Aliança"
 _ADM_TABS = {"socios", "vencimentos", "acessos"}
+
+
+def _blocks_update(view):
+    """Cadastro, renovação, foto, bloqueio e exclusão seguram a instalação."""
+
+    @wraps(view)
+    def wrapper(*args, **kwargs):
+        if request.method == "GET":
+            return view(*args, **kwargs)
+        try:
+            with updater.busy_operation():
+                return view(*args, **kwargs)
+        except updater.Busy as exc:
+            if _wants_json():
+                return jsonify({"ok": False, "error": str(exc)}), 503
+            flash(str(exc), "error")
+            return redirect(request.referrer or url_for("main.index"))
+
+    return wrapper
+
+
+def _local_admin_request() -> bool:
+    """Só o navegador deste PC instala ou procura atualização.
+
+    Confere o IP, o Host (contra DNS rebinding), a Origin e um header que
+    um formulário de outro site não consegue mandar sem preflight.
+    """
+    if request.remote_addr not in {"127.0.0.1", "::1"}:
+        return False
+    from app.config import PORT
+
+    allowed_hosts = {f"127.0.0.1:{PORT}", f"localhost:{PORT}"}
+    if request.host not in allowed_hosts:
+        return False
+    origin = request.headers.get("Origin")
+    if origin and origin not in {f"http://{host}" for host in allowed_hosts}:
+        return False
+    return request.headers.get("X-Acesso-Local") == "1"
 
 
 def _allowed_file(filename: str) -> bool:
@@ -235,6 +277,7 @@ def sync_foto(filename: str):
 
 
 @bp.route("/cadastrar", methods=["GET", "POST"])
+@_blocks_update
 def cadastrar():
     if request.method == "GET":
         return render_template(
@@ -340,6 +383,7 @@ def membros():
 
 
 @bp.post("/membros/<int:member_id>/renovar")
+@_blocks_update
 def renovar(member_id: int):
     member = db.get_member(member_id)
     if member is None:
@@ -441,6 +485,7 @@ def adm():
 
 
 @bp.post("/adm/membros/<int:member_id>/bloquear")
+@_blocks_update
 def adm_bloquear(member_id: int):
     member = db.get_member(member_id)
     if member is None:
@@ -466,6 +511,7 @@ def adm_bloquear(member_id: int):
 
 
 @bp.post("/adm/membros/<int:member_id>/foto")
+@_blocks_update
 def adm_atualizar_foto(member_id: int):
     member = db.get_member(member_id)
     if member is None:
@@ -542,6 +588,7 @@ def adm_sincronizar_logs():
 
 
 @bp.post("/adm/membros/<int:member_id>/excluir")
+@_blocks_update
 def adm_excluir(member_id: int):
     member = db.get_member(member_id)
     if member is None:
@@ -587,8 +634,41 @@ def fechar_aba():
     return ("", 204)
 
 
+@bp.get("/atualizacao/estado")
+def atualizacao_estado():
+    """Versão e estado da atualização. Não tem dados de sócios nem chaves."""
+    data = updater.status()
+    data["local"] = request.remote_addr in {"127.0.0.1", "::1"}
+    data["last_result"] = updater.last_result()
+    return jsonify(data)
+
+
+@bp.post("/atualizacao/verificar")
+def atualizacao_verificar():
+    if not _local_admin_request():
+        return jsonify({"ok": False, "error": "Só pelo próprio PC."}), 403
+    return jsonify({"ok": True, **updater.check_now()})
+
+
+@bp.post("/atualizacao/instalar")
+def atualizacao_instalar():
+    if not _local_admin_request():
+        return jsonify({"ok": False, "error": "Instale pelo próprio PC."}), 403
+    try:
+        updater.install()
+    except UpdateError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 409
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Falha ao iniciar a instalação")
+        return jsonify({"ok": False, "error": f"Não foi possível instalar: {exc}"}), 500
+    return jsonify({"ok": True, "message": "Instalando. O programa volta sozinho em instantes."})
+
+
 @bp.get("/saude")
 def saude():
+    if request.args.get("rapido"):
+        # O atualizador usa esta forma: responde sem consultar os faciais.
+        return jsonify({"app": "ok", "version": VERSION})
     status = {
         "app": "ok",
         "device": None,
@@ -596,6 +676,7 @@ def saude():
         "error": None,
         "media_base": None,
         "server_lan_ip_ok": bool(public_media_url("teste.jpg")),
+        "version": VERSION,
     }
     try:
         devices = DeviceFleet().status()
