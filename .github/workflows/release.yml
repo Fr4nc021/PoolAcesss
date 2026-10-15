@@ -1,0 +1,76 @@
+name: Release
+
+# Gera o pacote do Windows quando uma tag v* é enviada.
+# A release nasce como rascunho: os PCs só enxergam depois que o
+# manifest.sig, assinado fora do GitHub, é anexado e a release é publicada.
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Instalar dependências
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt pyinstaller
+
+      - name: Recusar segredos no checkout
+        shell: bash
+        run: |
+          set -euo pipefail
+          for path in .env env.txt data; do
+            if [ -e "$path" ]; then
+              echo "::error::$path não pode existir no repositório."
+              exit 1
+            fi
+          done
+
+      - name: Gerar executáveis
+        run: |
+          pyinstaller --noconfirm --clean AcessoPiscinas.spec
+          pyinstaller --noconfirm --clean AcessoPiscinas-Atualizador.spec
+
+      - name: Montar pacote e manifest
+        run: python scripts/build_release.py --tag "${{ github.ref_name }}" --require-key
+
+      - name: Conferir o .zip
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'EOF'
+          import sys, zipfile, pathlib
+          from app.update_core import is_protected
+          zips = list(pathlib.Path("dist/release").glob("*.zip"))
+          if len(zips) != 1:
+              sys.exit(f"Esperava um .zip, achei {len(zips)}")
+          names = zipfile.ZipFile(zips[0]).namelist()
+          bad = [n for n in names if is_protected(n.rstrip("/"))]
+          if bad:
+              sys.exit(f"Arquivos proibidos no pacote: {bad[:5]}")
+          print(f"{zips[0].name}: {len(names)} arquivos, nenhum proibido")
+          EOF
+
+      - name: Criar release em rascunho
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release create "${{ github.ref_name }}" \
+            --draft \
+            --title "Acesso Piscinas ${{ github.ref_name }}" \
+            --notes "Rascunho. Assine o manifest.json com scripts/release_sign.py, anexe o manifest.sig e publique." \
+            dist/release/*.zip dist/release/manifest.json
