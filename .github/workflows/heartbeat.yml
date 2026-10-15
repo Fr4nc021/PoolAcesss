@@ -1,0 +1,35 @@
+name: Heartbeat Supabase
+
+on:
+  schedule:
+    # 11:17 UTC = 08:17 em Brasília (UTC−3). Uma vez por dia.
+    - cron: "17 11 * * *"
+  workflow_dispatch:
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Atualizar system_heartbeat.last_ping
+        env:
+          HEARTBEAT_URL: ${{ secrets.HEARTBEAT_URL }}
+          HEARTBEAT_SECRET: ${{ secrets.HEARTBEAT_SECRET }}
+        run: |
+          set -euo pipefail
+          if [ -z "${HEARTBEAT_URL}" ] || [ -z "${HEARTBEAT_SECRET}" ]; then
+            echo "Configure os secrets HEARTBEAT_URL e HEARTBEAT_SECRET no repositório."
+            exit 1
+          fi
+          body_file="$(mktemp)"
+          status="$(curl -sS -o "${body_file}" -w "%{http_code}" \
+            -X POST \
+            -H "x-heartbeat-secret: ${HEARTBEAT_SECRET}" \
+            -H "content-type: application/json" \
+            --max-time 30 \
+            "${HEARTBEAT_URL}")"
+          echo "HTTP ${status}"
+          cat "${body_file}"
+          echo
+          if [ "${status}" != "200" ]; then
+            exit 1
+          fi
