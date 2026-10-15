@@ -18,10 +18,14 @@ from app.sync import (
     MemberSnapshot,
     _apply_event,
     _apply_remote_member,
+    _labels,
+    _set_cloud,
     _snapshot_from_payload,
+    _status_lock,
     event_payload,
     member_payload,
     merge_snapshots,
+    run_sync_cycle,
 )
 
 config.reload_env = lambda: None  # noqa: E731
@@ -159,6 +163,98 @@ def test_two_databases_share_member_photo_and_event() -> None:
         assert db.get_member_by_registration("AP00000001") is None
 
 
+def test_cloud_failure_sets_adm_alert() -> None:
+    import httpx
+    from app.sync import _remember_cloud_failure, _set_cloud, status_view
+
+    os.environ["SUPABASE_URL"] = "https://example.supabase.co"
+    os.environ["SUPABASE_KEY"] = "service-role-test"
+    try:
+        _remember_cloud_failure(httpx.ConnectError("offline"), action="enviar para a nuvem")
+        status = status_view()
+        assert status["cloud"] == "sem internet"
+        assert "Sem conexão com a internet" in status["cloud_alert"]
+        assert "dados locais" in status["cloud_alert"]
+    finally:
+        os.environ["SUPABASE_URL"] = ""
+        os.environ["SUPABASE_KEY"] = ""
+        _set_cloud("não configurada", "is-muted", "")
+
+
+def _reset_sync_labels() -> None:
+    with _status_lock:
+        _labels["peer"] = None
+        _labels["peer_class"] = None
+    _set_cloud("não configurada", "is-muted", "")
+
+
+def _use_temp_db(root: Path) -> None:
+    config.DATA_DIR = root
+    config.PHOTOS_DIR = root / "photos"
+    config.PHOTOS_DIR.mkdir(exist_ok=True)
+    config.DB_PATH = root / "sync.db"
+    db.DB_PATH = config.DB_PATH
+    db.init_db()
+
+
+def test_sync_button_reports_missing_config() -> None:
+    os.environ["SYNC_PEER_URL"] = ""
+    os.environ["SUPABASE_URL"] = ""
+    os.environ["SUPABASE_KEY"] = ""
+    os.environ["SYNC_TOKEN"] = "token-teste"
+    with tempfile.TemporaryDirectory() as tmp:
+        _use_temp_db(Path(tmp))
+        try:
+            report = run_sync_cycle()
+            assert report["peer"]["configured"] is False
+            assert "SYNC_PEER_URL" in report["peer"]["detail"]
+            assert report["cloud"]["configured"] is False
+            assert "SUPABASE_URL" in report["cloud"]["detail"]
+        finally:
+            _reset_sync_labels()
+
+
+def test_sync_button_explains_rejected_token() -> None:
+    import httpx
+
+    os.environ["SYNC_PEER_URL"] = "http://192.0.2.10:5000"
+    os.environ["SYNC_TOKEN"] = "token-teste"
+    os.environ["SUPABASE_URL"] = ""
+    os.environ["SUPABASE_KEY"] = ""
+    request = httpx.Request("GET", "http://192.0.2.10:5000/sync/estado")
+    response = httpx.Response(401, request=request)
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def get(self, *args, **kwargs):
+            return response
+
+    import app.sync as sync
+
+    original = sync.httpx.Client
+    sync.httpx.Client = FakeClient
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            _use_temp_db(Path(tmp))
+            report = run_sync_cycle()
+        assert report["peer"]["ok"] is False
+        assert report["peer"]["label"] == "token recusado"
+        assert "SYNC_TOKEN" in report["peer"]["detail"]
+        assert report["cloud"]["configured"] is False
+    finally:
+        sync.httpx.Client = original
+        os.environ["SYNC_PEER_URL"] = ""
+        _reset_sync_labels()
+
+
 def test_http_estado_requires_token() -> None:
     from app.expiry import stop_expiry_worker
     from app.main import create_app
@@ -191,6 +287,24 @@ def test_http_estado_requires_token() -> None:
             assert "Nuvem:" in html
             assert "não configurado" in html
             assert "não configurada" in html
+            adm = client.get("/adm")
+            assert adm.status_code == 200
+            adm_html = adm.get_data(as_text=True)
+            assert 'id="cloud-alert" class="flash flash-error" role="alert" hidden' in adm_html
+            assert "Testar sincronização" in adm_html
+            assert 'id="btn-test-sync"' in adm_html
+            tested = client.post("/adm/testar-sync")
+            assert tested.status_code == 200
+            tested_body = tested.get_json()
+            assert tested_body["ok"] is True
+            assert tested_body["peer"]["configured"] is False
+            assert "SYNC_PEER_URL" in tested_body["peer"]["detail"]
+            assert tested_body["cloud"]["configured"] is False
+            painel = client.get("/sync/painel")
+            assert painel.status_code == 200
+            status = painel.get_json()
+            assert status["cloud"] == "não configurada"
+            assert status["cloud_alert"] == ""
         finally:
             stop_sync_worker()
             stop_expiry_worker()
@@ -208,6 +322,9 @@ def main() -> None:
     test_local_renewal_survives_newer_stale_block()
     test_newer_photo_wins()
     test_two_databases_share_member_photo_and_event()
+    test_cloud_failure_sets_adm_alert()
+    test_sync_button_reports_missing_config()
+    test_sync_button_explains_rejected_token()
     test_http_estado_requires_token()
     print("sync ok")
 
