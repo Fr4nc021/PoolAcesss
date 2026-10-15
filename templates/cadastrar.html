@@ -277,7 +277,16 @@
       if (window.__acessoStay) window.__acessoStay();
       window.location.href = data.redirect || "{{ url_for('main.membros') }}";
     } catch (err) {
-      showError(err.message || String(err));
+      const msg = err.message || String(err);
+      showError(msg);
+      if (/foto não foi aceita/i.test(msg)) {
+        showInfo("Cadastro cancelado. Tire outra foto e tente de novo.");
+        capturedFile = null;
+        input.value = "";
+        wrap.hidden = true;
+        preview.removeAttribute("src");
+        photoStatus.hidden = true;
+      }
       setBusy(false);
     }
   });
