@@ -3,6 +3,9 @@ from __future__ import annotations
 import ctypes
 import logging
 import os
+import shutil
+import signal
+import subprocess
 import sys
 import threading
 
@@ -40,8 +43,46 @@ def silence_missing_stdio() -> None:
         sys.stderr = open(os.devnull, "w", encoding="utf-8")
 
 
+def open_local_browser(port: int) -> None:
+    """Abre a tela no Chrome. No Chromebook o Chrome fica fora do Linux."""
+    url = f"http://127.0.0.1:{port}/"
+    from app.config import on_chromeos
+
+    if on_chromeos():
+        for cmd in (["garcon-url-handler", url], ["xdg-open", url]):
+            try:
+                subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                return
+            except OSError:
+                continue
+    import webbrowser
+
+    webbrowser.open(url)
+
+
+def install_shutdown_signals() -> None:
+    """No ChromeOS, fechar o terminal sincroniza antes de sair."""
+    if os.name == "nt":
+        return
+
+    def _handle(_signum, _frame) -> None:
+        _shutdown(None)
+
+    for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        try:
+            signal.signal(sig, _handle)
+        except (OSError, ValueError):
+            continue
+
+
 def start_tray() -> None:
-    """Ícone ao lado do relógio. Clicar pede confirmação antes de sair."""
+    """Ícone ao lado do relógio, só no Windows."""
+    if os.name != "nt":
+        return
     try:
         import pystray
     except ImportError:
@@ -102,14 +143,28 @@ def _ask_close_from_browser() -> None:
     if not _ask_yes_no():
         from app.config import PORT
 
-        import webbrowser
-
-        webbrowser.open(f"http://127.0.0.1:{PORT}/")
+        open_local_browser(PORT)
         return
     _shutdown(_tray_icon)
 
 
 def _ask_yes_no() -> bool:
+    if os.name != "nt":
+        zenity = shutil.which("zenity")
+        if not zenity:
+            logger.info("Feche o Terminal para encerrar o Acesso Piscinas.")
+            return False
+        result = subprocess.run(
+            [
+                zenity,
+                "--question",
+                "--no-wrap",
+                "--title=Acesso Piscinas",
+                "--text=Fechar programa?",
+            ],
+            check=False,
+        )
+        return result.returncode == 0
     answer = ctypes.windll.user32.MessageBoxW(
         None,
         "Fechar programa?",

@@ -28,10 +28,28 @@ RESOURCE_DIR = _resource_dir()
 BASE_DIR = RUNTIME_DIR
 
 
+def on_chromeos() -> bool:
+    """Verdadeiro dentro do Linux do Chromebook (Crostini)."""
+    if os.name == "nt":
+        return False
+    if os.environ.get("SOMMELIER_VERSION"):
+        return True
+    return Path("/opt/google/cros-containers").is_dir() or Path("/dev/.cros_milestone").exists()
+
+
+def _env_file() -> Optional[Path]:
+    """env.txt passa pelo Chromebook. .env continua valendo no Windows."""
+    for name in ("env.txt", ".env"):
+        path = RUNTIME_DIR / name
+        if path.is_file():
+            return path
+    return None
+
+
 def reload_env() -> None:
-    """Relê o .env ao lado do programa (UTF-8 ou UTF-16 do Bloco de Notas)."""
-    path = RUNTIME_DIR / ".env"
-    if not path.is_file():
+    """Relê env.txt ou .env ao lado do programa (UTF-8 ou UTF-16 do Bloco de Notas)."""
+    path = _env_file()
+    if path is None:
         return
     raw = path.read_bytes()
     if raw.startswith((b"\xff\xfe", b"\xfe\xff")):
