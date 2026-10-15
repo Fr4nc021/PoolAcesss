@@ -8,46 +8,29 @@ if not exist ".venv\Scripts\python.exe" (
 )
 ".venv\Scripts\python.exe" -m pip install -r requirements.txt pyinstaller
 ".venv\Scripts\pyinstaller.exe" --noconfirm --clean AcessoPiscinas.spec
-
 if errorlevel 1 (
   echo Falha no PyInstaller.
   pause
   exit /b 1
 )
-
-REM Monta pasta de distribuicao pronta para copiar
-set DIST=dist\AcessoPiscinas_Pacote
-if exist "%DIST%" rmdir /s /q "%DIST%"
-mkdir "%DIST%"
-xcopy /E /I /Y "dist\AcessoPiscinas\*" "%DIST%\" >nul
-
-copy /Y "assets\aquaaccess.ico" "%DIST%\aquaaccess.ico" >nul
-copy /Y ".env.example" "%DIST%\.env.example" >nul
-copy /Y ".env.example" "%DIST%\env.exemplo.txt" >nul
-if exist ".env" (
-  copy /Y ".env" "%DIST%\.env" >nul
-  copy /Y ".env" "%DIST%\env.txt" >nul
-) else (
-  copy /Y ".env.example" "%DIST%\.env" >nul
-  copy /Y ".env.example" "%DIST%\env.txt" >nul
+".venv\Scripts\pyinstaller.exe" --noconfirm --clean AcessoPiscinas-Atualizador.spec
+if errorlevel 1 (
+  echo Falha no PyInstaller do atualizador.
+  pause
+  exit /b 1
 )
 
-(
-echo AcessoPiscinas - como usar neste PC
-echo ==================================
-echo.
-echo 1. Edite o arquivo env.txt se precisar ^(IP do XPE, senha^).
-echo 2. Dê dois cliques em AcessoPiscinas.exe
-echo    Na primeira abertura surge o atalho Acesso Piscinas na area de trabalho.
-echo 3. O Chrome abre em http://127.0.0.1:5000
-echo 4. Em outro PC da rede: http://IP-DESTE-PC:5000
-echo.
-echo Nao ha janela preta. Para fechar, clique no icone ao lado do relogio
-echo e confirme "Fechar programa". O sistema sincroniza antes de sair.
-echo.
-) > "%DIST%\LEIA-ME.txt"
+REM Monta dist\AcessoPiscinas_Pacote, o .zip e o manifest em dist\release.
+REM O .env deste PC nao entra no pacote: senha do facial e chave da nuvem ficam aqui.
+".venv\Scripts\python.exe" scripts\build_release.py
+if errorlevel 1 (
+  echo Falha ao montar o pacote.
+  pause
+  exit /b 1
+)
 
 echo.
-echo Pacote pronto em: %DIST%
+echo Pacote pronto em: dist\AcessoPiscinas_Pacote
+echo Na primeira instalacao, copie env.exemplo.txt para env.txt e preencha.
 echo.
 pause

@@ -63,3 +63,7 @@ htmlcov/
 
 # --- Supabase CLI (local) ---
 supabase/.temp/
+
+# --- Atualizacao automatica (pasta local de cada PC) ---
+_update/
+release-v*/
