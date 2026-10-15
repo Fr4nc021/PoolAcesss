@@ -23,8 +23,8 @@
         <a href="{{ url_for('main.adm') }}" class="nav-link {% if request.endpoint == 'main.adm' %}is-active{% endif %}">ADM</a>
       </nav>
       <p class="sync-status" aria-label="Sincronização">
-        <span class="{{ sync_status.peer_class }}">Outro PC: {{ sync_status.peer }}</span>
-        <span class="{{ sync_status.cloud_class }}">Nuvem: {{ sync_status.cloud }}</span>
+        <span id="peer-status" class="{{ sync_status.peer_class }}">Outro PC: {{ sync_status.peer }}</span>
+        <span id="cloud-status" class="{{ sync_status.cloud_class }}">Nuvem: {{ sync_status.cloud }}</span>
       </p>
     </header>
 

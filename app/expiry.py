@@ -67,6 +67,10 @@ def sync_expired_members(client: Optional[IntelbrasClient] = None) -> int:
         except DeviceError as exc:
             logger.error("Falha ao bloquear member_id=%s: %s", member.id, exc)
 
+    if blocked:
+        from app.sync import request_sync
+
+        request_sync()
     return blocked
 
 

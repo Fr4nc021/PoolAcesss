@@ -116,12 +116,23 @@ body {
   font-size: 0.82rem;
 }
 
-.sync-status .is-ok {
+.sync-status .is-ok,
+.sync-test .is-ok {
   color: var(--ok);
 }
 
-.sync-status .is-wait {
+.sync-status .is-wait,
+.sync-test .is-wait {
   color: var(--warn);
+}
+
+.sync-status .is-bad,
+.sync-test .is-bad {
+  color: var(--err);
+}
+
+#cloud-alert {
+  margin-bottom: 1rem;
 }
 
 .sync-status .is-muted {
@@ -245,6 +256,31 @@ body {
   align-items: flex-start;
   justify-content: space-between;
   gap: 1rem;
+}
+
+.panel-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.6rem;
+}
+
+.sync-test {
+  display: grid;
+  gap: 0.35rem;
+  margin-top: 1rem;
+  padding: 0.85rem 1rem;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.55);
+}
+
+.sync-test[hidden] {
+  display: none !important;
+}
+
+.sync-test p {
+  margin: 0;
+  line-height: 1.45;
 }
 
 .panel h1,

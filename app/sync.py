@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import threading
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -18,6 +19,7 @@ from app.intelbras_client import DeviceError, fleet_for_pool, public_media_url
 logger = logging.getLogger(__name__)
 
 _stop_event = threading.Event()
+_wake_event = threading.Event()
 _thread: Optional[threading.Thread] = None
 _cycle_lock = threading.Lock()
 _status_lock = threading.Lock()
@@ -26,6 +28,7 @@ _labels: dict[str, Optional[str]] = {
     "peer_class": None,
     "cloud": None,
     "cloud_class": None,
+    "cloud_alert": None,
 }
 _bucket_ready = False
 
@@ -110,21 +113,33 @@ def status_view() -> dict[str, str]:
         peer_class = _labels["peer_class"]
         cloud = _labels["cloud"]
         cloud_class = _labels["cloud_class"]
+        cloud_alert = _labels["cloud_alert"]
     if peer is None:
         if settings.peer_url:
             peer, peer_class = "sem contato", "is-wait"
         else:
             peer, peer_class = "não configurado", "is-muted"
-    if cloud is None:
-        if settings.cloud_enabled:
-            cloud, cloud_class = "sem internet", "is-wait"
-        else:
-            cloud, cloud_class = "não configurada", "is-muted"
+    if not settings.cloud_enabled:
+        cloud, cloud_class, cloud_alert = "não configurada", "is-muted", ""
+    elif cloud is None:
+        cloud, cloud_class = "sem internet", "is-wait"
+        cloud_alert = cloud_alert or (
+            "A nuvem ainda não recebeu os dados deste PC. "
+            "O envio será tentado de novo automaticamente."
+        )
+    elif cloud_class == "is-ok":
+        cloud_alert = ""
+    elif not cloud_alert:
+        cloud_alert = (
+            "A nuvem parou de receber atualizações. "
+            "Os dados locais continuam neste PC e o envio será tentado de novo."
+        )
     return {
         "peer": peer or "não configurado",
         "peer_class": peer_class or "is-muted",
         "cloud": cloud or "não configurada",
         "cloud_class": cloud_class or "is-muted",
+        "cloud_alert": cloud_alert or "",
     }
 
 
@@ -177,26 +192,15 @@ def event_payload(event: db.AccessEvent) -> dict:
     }
 
 
-def run_sync_cycle() -> None:
+def run_sync_cycle() -> dict[str, dict[str, object]]:
+    """Troca com o outro PC e com a nuvem. O retorno é o resumo do botão de teste."""
     with _cycle_lock:
         settings = sync_settings()
+        peer = _exchange_with_peer(settings)
+
         remote_members: Optional[dict[str, MemberSnapshot]] = None
         remote_event_ids: Optional[set[str]] = None
         remote_deletions: Optional[dict[str, datetime]] = None
-
-        if settings.peer_url:
-            if not settings.token:
-                logger.warning("SYNC_PEER_URL definido sem SYNC_TOKEN")
-                _set_peer("sem contato", "is-wait")
-            else:
-                try:
-                    _pull_lan(settings.peer_url, settings.token)
-                    _set_peer("atualizado", "is-ok")
-                except Exception as exc:  # noqa: BLE001 — o PC local segue sem o outro
-                    logger.warning("Sync com o outro PC falhou: %s", exc)
-                    _set_peer("sem contato", "is-wait")
-        else:
-            _set_peer("não configurado", "is-muted")
 
         if settings.cloud_enabled:
             try:
@@ -206,9 +210,9 @@ def run_sync_cycle() -> None:
                 )
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Leitura da nuvem falhou: %s", exc)
-                _set_cloud("sem internet", "is-wait")
+                _remember_cloud_failure(exc, action="ler a nuvem")
         else:
-            _set_cloud("não configurada", "is-muted")
+            _set_cloud("não configurada", "is-muted", "")
 
         _apply_pending_unblocks()
 
@@ -221,15 +225,38 @@ def run_sync_cycle() -> None:
                     remote_event_ids,
                     remote_deletions or {},
                 )
-                _set_cloud("backup em dia", "is-ok")
+                _set_cloud("backup em dia", "is-ok", "")
+                cloud = _cloud_ok_report(len(remote_members))
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Envio para a nuvem falhou: %s", exc)
-                _set_cloud("sem internet", "is-wait")
+                _remember_cloud_failure(exc, action="enviar para a nuvem")
+                cloud = _cloud_fail_report()
+        elif settings.cloud_enabled:
+            cloud = _cloud_fail_report()
+        else:
+            cloud = {
+                "ok": False,
+                "configured": False,
+                "label": "não configurada",
+                "css": "is-muted",
+                "detail": (
+                    "SUPABASE_URL ou SUPABASE_KEY está vazio. "
+                    "O backup na nuvem fica desligado."
+                ),
+            }
+
+        return {"peer": peer, "cloud": cloud}
 
 
 def refresh_from_peers() -> None:
     """Puxa o outro PC e a nuvem antes de bloquear exames vencidos."""
     run_sync_cycle()
+
+
+def request_sync() -> None:
+    """Pede um envio agora, depois de uma alteração local ou quando a internet voltar."""
+    start_sync_worker()
+    _wake_event.set()
 
 
 def start_sync_worker() -> None:
@@ -250,14 +277,140 @@ def _worker() -> None:
     while not _stop_event.is_set():
         try:
             run_sync_cycle()
-        except Exception:
+        except Exception as exc:
             logger.exception("Erro no ciclo de sincronização")
+            if sync_settings().cloud_enabled:
+                _remember_cloud_failure(exc, action="sincronizar com a nuvem")
         interval = sync_settings().interval
-        if _stop_event.wait(interval):
-            break
+        deadline = time.monotonic() + interval
+        while not _stop_event.is_set():
+            if _wake_event.is_set():
+                _wake_event.clear()
+                break
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            _stop_event.wait(min(0.4, remaining))
 
 
-def _pull_lan(peer_url: str, token: str) -> None:
+def _exchange_with_peer(settings) -> dict[str, object]:
+    if not settings.peer_url:
+        _set_peer("não configurado", "is-muted")
+        return {
+            "ok": False,
+            "configured": False,
+            "label": "não configurado",
+            "css": "is-muted",
+            "detail": "SYNC_PEER_URL está vazio. A troca com o outro PC fica desligada.",
+        }
+    if not settings.token:
+        logger.warning("SYNC_PEER_URL definido sem SYNC_TOKEN")
+        _set_peer("sem token", "is-bad")
+        return {
+            "ok": False,
+            "configured": False,
+            "label": "sem token",
+            "css": "is-bad",
+            "detail": "SYNC_PEER_URL está preenchido, mas falta o SYNC_TOKEN neste PC.",
+        }
+    url = settings.peer_url
+    try:
+        count = _pull_lan(url, settings.token)
+    except Exception as exc:  # noqa: BLE001 — o PC local segue sem o outro
+        logger.warning("Sync com o outro PC falhou: %s", exc)
+        label, css, detail = _peer_failure(exc, url)
+        _set_peer(label, css)
+        return {
+            "ok": False,
+            "configured": True,
+            "label": label,
+            "css": css,
+            "detail": detail,
+        }
+    _set_peer("atualizado", "is-ok")
+    if count == 0:
+        detail = (
+            f"Conectou em {url}. O outro PC respondeu e ainda não tem cadastros. "
+            "A ligação está funcionando. No outro computador, clique em "
+            "Testar sincronização para conferir o caminho de volta."
+        )
+    else:
+        detail = (
+            f"Conectou em {url}. Foram conferidos {count} cadastro(s) do outro PC. "
+            "No outro computador, clique em Testar sincronização para conferir o caminho de volta."
+        )
+    return {
+        "ok": True,
+        "configured": True,
+        "label": "atualizado",
+        "css": "is-ok",
+        "detail": detail,
+    }
+
+
+def _peer_failure(exc: Exception, url: str) -> tuple[str, str, str]:
+    if isinstance(exc, httpx.TimeoutException):
+        return (
+            "sem contato",
+            "is-wait",
+            (
+                f"O outro PC em {url} não respondeu a tempo. "
+                "Confira se o programa está aberto lá e se o firewall libera a porta 5000."
+            ),
+        )
+    if isinstance(exc, httpx.ConnectError):
+        return (
+            "sem contato",
+            "is-wait",
+            (
+                f"Não foi possível alcançar {url}. "
+                "Confira o IP no SYNC_PEER_URL e se os dois PCs estão na mesma rede."
+            ),
+        )
+    if isinstance(exc, httpx.HTTPStatusError):
+        if exc.response.status_code == 401:
+            return (
+                "token recusado",
+                "is-bad",
+                "O outro PC recusou o SYNC_TOKEN. O segredo precisa ser igual nos dois .env.",
+            )
+        return (
+            "sem contato",
+            "is-bad",
+            f"O outro PC em {url} respondeu com erro {exc.response.status_code}.",
+        )
+    return ("sem contato", "is-wait", f"Falha ao falar com {url}: {exc}")
+
+
+def _cloud_ok_report(remote_count: int) -> dict[str, object]:
+    if remote_count == 0:
+        detail = "Conectou na nuvem e enviou o backup deste PC. A nuvem ainda não tinha cadastros."
+    else:
+        detail = (
+            f"Conectou na nuvem e enviou o backup deste PC. "
+            f"A nuvem já tinha {remote_count} cadastro(s)."
+        )
+    return {
+        "ok": True,
+        "configured": True,
+        "label": "backup em dia",
+        "css": "is-ok",
+        "detail": detail,
+    }
+
+
+def _cloud_fail_report() -> dict[str, object]:
+    status = status_view()
+    return {
+        "ok": False,
+        "configured": True,
+        "label": status["cloud"],
+        "css": status["cloud_class"],
+        "detail": status["cloud_alert"] or status["cloud"],
+    }
+
+
+def _pull_lan(peer_url: str, token: str) -> int:
     headers = {"Authorization": f"Bearer {token}"}
     with httpx.Client(timeout=8.0) as client:
         response = client.get(f"{peer_url}/sync/estado", headers=headers)
@@ -268,12 +421,14 @@ def _pull_lan(peer_url: str, token: str) -> None:
 
         _apply_deletion_list(payload.get("deletions") or [])
 
+        member_count = 0
         for item in payload.get("members") or []:
             if not isinstance(item, dict):
                 continue
             remote = _snapshot_from_payload(item)
             if remote is None:
                 continue
+            member_count += 1
 
             def fetch(snapshot: MemberSnapshot = remote) -> Optional[bytes]:
                 filename = snapshot.photo_filename
@@ -296,6 +451,7 @@ def _pull_lan(peer_url: str, token: str) -> None:
         for item in payload.get("events") or []:
             if isinstance(item, dict):
                 _apply_event(item)
+        return member_count
 
 
 def _pull_cloud(
@@ -718,10 +874,51 @@ def _set_peer(label: str, css: str) -> None:
         _labels["peer_class"] = css
 
 
-def _set_cloud(label: str, css: str) -> None:
+def _set_cloud(label: str, css: str, alert: str = "") -> None:
     with _status_lock:
         _labels["cloud"] = label
         _labels["cloud_class"] = css
+        _labels["cloud_alert"] = alert
+
+
+def _remember_cloud_failure(exc: Exception, *, action: str) -> None:
+    if isinstance(exc, httpx.TransportError):
+        _set_cloud(
+            "sem internet",
+            "is-wait",
+            (
+                f"Sem conexão com a internet ao {action}. "
+                "Os dados locais continuam neste PC e sobem assim que a conexão voltar."
+            ),
+        )
+        return
+    if isinstance(exc, httpx.HTTPStatusError):
+        body = exc.response.text
+        detail = " ".join(body.split())[:160]
+        hint = ""
+        if "42501" in body or "permission denied" in body.lower():
+            hint = (
+                " Confira se SUPABASE_KEY no .env é a chave service_role "
+                "(não a anon/public) e rode scripts/supabase_schema.sql no SQL Editor do Supabase."
+            )
+        _set_cloud(
+            "falha na nuvem",
+            "is-bad",
+            (
+                f"A nuvem recusou {action} (erro {exc.response.status_code}). "
+                f"{detail}{hint} "
+                "Os dados locais continuam neste PC e o envio será tentado de novo."
+            ),
+        )
+        return
+    _set_cloud(
+        "falha na nuvem",
+        "is-bad",
+        (
+            f"Falha ao {action}: {exc}. "
+            "Os dados locais continuam neste PC e o envio será tentado de novo."
+        ),
+    )
 
 
 def _iso(value: datetime) -> str:

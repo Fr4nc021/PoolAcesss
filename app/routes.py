@@ -30,7 +30,7 @@ from app.config import (
     sync_settings,
 )
 from app.intelbras_client import DeviceError, DeviceFleet, fleet_for_pool, public_media_url
-from app.sync import build_state
+from app.sync import build_state, request_sync, run_sync_cycle, status_view
 from app.tray import schedule_close_prompt
 
 logger = logging.getLogger(__name__)
@@ -183,6 +183,8 @@ def _sync_door_logs() -> int:
         )
         if inserted:
             added += 1
+    if added:
+        request_sync()
     return added
 
 
@@ -271,6 +273,11 @@ def cadastrar():
         return fail(f"Não foi possível salvar a foto: {exc}", 500)
 
     face_url = public_media_url(photo_path.name)
+    if not face_url:
+        return fail(
+            "SERVER_LAN_IP não está no .env. O facial precisa desse IP para baixar a foto deste PC.",
+            500,
+        )
     client = fleet_for_pool(pool)
     try:
         created = client.register_member(
@@ -302,26 +309,22 @@ def cadastrar():
         f"{member.name} cadastrado(a) (matrícula {member.registration}). "
         f"Exame médico válido até "
         f"{member.medical_exam_expires_at.strftime('%d/%m/%Y %H:%M')}. "
-        f"Cadastro enviado para {pool_label(pool)}. "
-        f"No XPE, abra Controle de Acesso → Usuários e busque pelo nome ou pela matrícula "
-        f"{member.registration}."
+        f"Foto confirmada no Intelbras ({pool_label(pool)})."
     )
-    if not created.face_ok:
-        msg += (
-            " Aviso: a face pode não ter sido validada. Confira a foto no aparelho."
-        )
+
+    request_sync()
 
     if _wants_json():
         return jsonify(
             {
                 "ok": True,
                 "message": msg,
-                "face_ok": created.face_ok,
+                "face_ok": True,
                 "redirect": url_for("main.membros"),
             }
         )
 
-    flash(msg, "success" if created.face_ok else "error")
+    flash(msg, "success")
     return redirect(url_for("main.membros"))
 
 
@@ -367,12 +370,31 @@ def renovar(member_id: int):
         flash(f"Não foi possível renovar no equipamento: {exc}", "error")
         return _redirect_after_member_action(url_for("main.membros"))
 
+    request_sync()
     flash(
         f"Exame médico de {updated.name} renovado até "
-        f"{updated.medical_exam_expires_at.strftime('%d/%m/%Y %H:%M')}.",
+        f"{updated.medical_exam_expires_at.strftime('%d/%m/%Y %H:%M')}. "
+        "Foto confirmada no Intelbras.",
         "success",
     )
     return _redirect_after_member_action(url_for("main.membros"))
+
+
+@bp.get("/sync/painel")
+def sync_painel():
+    """Estado da nuvem para o aviso da aba ADM. Não inclui chaves nem dados de sócios."""
+    return jsonify(status_view())
+
+
+@bp.post("/adm/testar-sync")
+def adm_testar_sync():
+    """Roda a troca agora e devolve o resultado do outro PC e da nuvem."""
+    try:
+        report = run_sync_cycle()
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Teste de sincronização falhou")
+        return jsonify({"ok": False, "error": f"Não foi possível testar: {exc}"}), 500
+    return jsonify({"ok": True, **report})
 
 
 @bp.get("/adm")
@@ -438,6 +460,7 @@ def adm_bloquear(member_id: int):
         flash(f"Não foi possível bloquear no equipamento: {exc}", "error")
         return _redirect_adm("socios")
 
+    request_sync()
     flash(f"Acesso de {member.name} bloqueado.", "success")
     return _redirect_adm("socios")
 
@@ -465,6 +488,15 @@ def adm_atualizar_foto(member_id: int):
         return _redirect_adm("socios")
 
     face_url = public_media_url(photo_path.name)
+    if not face_url and not member.access_blocked and not member.is_expired:
+        if photo_path.exists():
+            photo_path.unlink(missing_ok=True)
+        flash(
+            "SERVER_LAN_IP não está no .env. O facial precisa desse IP para receber a foto.",
+            "error",
+        )
+        return _redirect_adm("socios")
+
     client = fleet_for_pool(member.pool)
     try:
         if member.access_blocked or member.is_expired:
@@ -488,10 +520,11 @@ def adm_atualizar_foto(member_id: int):
         logger.exception("Falha ao atualizar foto no equipamento")
         if photo_path.exists():
             photo_path.unlink(missing_ok=True)
-        flash(f"Não foi possível atualizar a foto no equipamento: {exc}", "error")
+        flash(str(exc), "error")
         return _redirect_adm("socios")
 
-    flash(f"Foto de {member.name} atualizada.", "success")
+    request_sync()
+    flash(f"Foto de {member.name} confirmada no Intelbras.", "success")
     return _redirect_adm("socios")
 
 
@@ -542,6 +575,7 @@ def adm_excluir(member_id: int):
         return _redirect_adm("socios")
 
     _remove_member_photo(photo_path)
+    request_sync()
     flash(f"Cadastro de {member.name} excluído.", "success")
     return _redirect_adm("socios")
 
@@ -555,11 +589,24 @@ def fechar_aba():
 
 @bp.get("/saude")
 def saude():
-    status = {"app": "ok", "device": None, "devices": [], "error": None, "media_base": None}
+    status = {
+        "app": "ok",
+        "device": None,
+        "devices": [],
+        "error": None,
+        "media_base": None,
+        "server_lan_ip_ok": bool(public_media_url("teste.jpg")),
+    }
     try:
         devices = DeviceFleet().status()
         status["devices"] = devices
         status["media_base"] = public_media_url("teste.jpg")
+        if not status["server_lan_ip_ok"]:
+            status["error"] = (
+                (status.get("error") or "")
+                + ("; " if status.get("error") else "")
+                + "SERVER_LAN_IP vazio no .env — o facial não consegue baixar fotos deste PC"
+            ).strip("; ")
         online = [item for item in devices if item.get("ok")]
         if online and len(online) == len(devices):
             status["device"] = ", ".join(

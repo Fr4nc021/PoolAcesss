@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import logging
+import os
 import tarfile
 import time
 import xml.etree.ElementTree as ET
@@ -9,7 +10,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import httpx
 from PIL import Image
@@ -31,6 +32,15 @@ from app.config import (
 ALWAYS_SCHEDULE_RELAY = f"1001-{DOOR_NUM}"
 # Termo de validade na tela: 0 = Sempre, 1 = Nunca, 2 = Agenda.
 FACE_VALIDITY_ALWAYS = "0"
+FACE_SEND_ROUNDS = 3
+FACE_CONFIRM_RETRIES = 8
+FACE_CONFIRM_DELAY = 1.5
+
+FACE_NOT_ACCEPTED_MSG = (
+    "A foto não foi aceita pelo equipamento Intelbras. "
+    "Tire outra foto com o rosto de frente, bem iluminado, "
+    "sem boné ou óculos escuro, e tente cadastrar de novo."
+)
 
 logger = logging.getLogger(__name__)
 
@@ -113,6 +123,99 @@ class IntelbrasClient:
                 return user
         return None
 
+    def _face_confirmed(
+        self,
+        registration: str,
+        *,
+        retries: int = FACE_CONFIRM_RETRIES,
+    ) -> bool:
+        for attempt in range(retries):
+            user = self.find_user_by_registration(registration)
+            if user:
+                status = user.get("FaceStatus")
+                if status in (1, "1", True):
+                    return True
+                face_id = user.get("FaceID")
+                if face_id not in (None, "", "0", 0):
+                    return True
+            if attempt + 1 < retries:
+                time.sleep(FACE_CONFIRM_DELAY)
+        return False
+
+    def _face_attempts(
+        self,
+        *,
+        registration: str,
+        name: str,
+        jpeg_path: Path,
+        device_user_id: int,
+        face_public_url: Optional[str],
+    ) -> list[tuple[str, Callable[[], None]]]:
+        short_name = name.strip()[:60]
+        attempts: list[tuple[str, Callable[[], None]]] = []
+        if face_public_url and face_public_url.startswith("http://"):
+            attempts.append(
+                (
+                    "url",
+                    lambda: self.update_user(
+                        device_user_id=device_user_id,
+                        registration=registration,
+                        name=name,
+                        face_public_url=face_public_url,
+                    ),
+                )
+            )
+        attempts.extend(
+            [
+                (
+                    "import",
+                    lambda: self._attach_face_via_import(
+                        registration=registration,
+                        name=short_name,
+                        jpeg_path=jpeg_path,
+                        device_user_id=device_user_id,
+                    ),
+                ),
+                (
+                    "register_img",
+                    lambda: self._send_face_via_register_img(
+                        registration=registration,
+                        name=name,
+                        jpeg_path=jpeg_path,
+                        device_user_id=device_user_id,
+                    ),
+                ),
+                (
+                    "base64",
+                    lambda: self.update_user(
+                        device_user_id=device_user_id,
+                        registration=registration,
+                        name=name,
+                        image_path=jpeg_path,
+                    ),
+                ),
+                (
+                    "base64_data_uri",
+                    lambda: self._send_face_via_data_uri(
+                        device_user_id=device_user_id,
+                        registration=registration,
+                        name=name,
+                        jpeg_path=jpeg_path,
+                    ),
+                ),
+                (
+                    "multipart",
+                    lambda: self._send_face_via_multipart(
+                        device_user_id=device_user_id,
+                        registration=registration,
+                        name=name,
+                        jpeg_path=jpeg_path,
+                    ),
+                ),
+            ]
+        )
+        return attempts
+
     def create_user_with_face(
         self,
         name: str,
@@ -122,7 +225,6 @@ class IntelbrasClient:
         face_public_url: Optional[str] = None,
         image_ready: bool = False,
     ) -> CreatedUser:
-        _ = face_public_url
         reg = (registration or f"AP{int(time.time()) % 100000000:08d}")[:12]
         jpeg_path = image_path if image_ready else _ensure_jpeg_file(image_path)
 
@@ -173,6 +275,7 @@ class IntelbrasClient:
             name=name,
             jpeg_path=jpeg_path,
             device_user_id=device_id,
+            face_public_url=face_public_url,
         )
 
         try:
@@ -186,17 +289,20 @@ class IntelbrasClient:
             logger.warning("Relé permitido / validade sempre não confirmados: %s", exc)
 
         if not face_ok:
-            logger.warning(
-                "Usuário %s criado no XPE sem confirmação de FaceStatus. "
-                "Verifique em Moradores > Usuário (busque a matrícula %s).",
-                reg,
+            logger.error(
+                "Face não confirmada para %s — removendo cadastro incompleto do XPE",
                 reg,
             )
+            try:
+                self.delete_user(registration=reg)
+            except DeviceError as exc:
+                logger.warning("Rollback do usuário %s falhou: %s", reg, exc)
+            raise DeviceError(FACE_NOT_ACCEPTED_MSG)
 
         return CreatedUser(
             device_user_id=device_id,
             registration=reg,
-            face_ok=face_ok,
+            face_ok=True,
         )
 
     def _send_face(
@@ -206,31 +312,156 @@ class IntelbrasClient:
         name: str,
         jpeg_path: Path,
         device_user_id: int,
+        face_public_url: Optional[str] = None,
     ) -> bool:
-        """Grava a foto pelo import. Base64 só entra se o import falhar."""
+        """Tenta vários métodos, em rodadas, até o XPE confirmar FaceStatus."""
+        attempts = self._face_attempts(
+            registration=registration,
+            name=name,
+            jpeg_path=jpeg_path,
+            device_user_id=device_user_id,
+            face_public_url=face_public_url,
+        )
+        for round_num in range(FACE_SEND_ROUNDS):
+            for label, action in attempts:
+                try:
+                    action()
+                except Exception as exc:  # noqa: BLE001 — tenta o próximo método
+                    logger.warning(
+                        "Face via %s (rodada %s) falhou (reg=%s): %s",
+                        label,
+                        round_num + 1,
+                        registration,
+                        exc,
+                    )
+                    continue
+                if self._face_confirmed(registration):
+                    logger.info(
+                        "Face confirmada via %s na rodada %s (reg=%s)",
+                        label,
+                        round_num + 1,
+                        registration,
+                    )
+                    return True
+                logger.warning(
+                    "%s aceito na rodada %s, mas FaceStatus não confirmou (reg=%s)",
+                    label,
+                    round_num + 1,
+                    registration,
+                )
+            if round_num + 1 < FACE_SEND_ROUNDS:
+                time.sleep(1.5)
+        return False
+
+    def _send_face_via_data_uri(
+        self,
+        *,
+        device_user_id: int,
+        registration: str,
+        name: str,
+        jpeg_path: Path,
+    ) -> None:
+        encoded = _prepare_jpeg_base64(jpeg_path)
+        self.update_user(
+            device_user_id=device_user_id,
+            registration=registration,
+            name=name,
+            face_public_url=f"data:image/jpeg;base64,{encoded}",
+        )
+
+    def _next_face_id(self) -> int:
+        max_face = 0
+        for user in self.list_users():
+            try:
+                max_face = max(max_face, int(user.get("FaceID") or 0))
+            except (TypeError, ValueError):
+                pass
         try:
-            self._attach_face_via_import(
-                registration=registration,
-                name=name.strip()[:60],
-                jpeg_path=jpeg_path,
-                device_user_id=device_user_id,
-            )
-            logger.info("Usuário sincronizado via import tgz (reg=%s)", registration)
-            return True
-        except Exception as exc:  # noqa: BLE001 — tenta o envio direto em seguida
-            logger.warning("Import de face falhou, tentando base64: %s", exc)
-        try:
-            self.update_user(
-                device_user_id=device_user_id,
-                registration=registration,
-                name=name,
-                image_path=jpeg_path,
-            )
-            logger.info("Face enviada via base64 (reg=%s)", registration)
-            return True
-        except DeviceError as exc:
-            logger.warning("Tentativa de face (base64) falhou: %s", exc)
-            return False
+            with self._client() as client:
+                exported = client.get(self._url("/api/user/export"))
+                exported.raise_for_status()
+                raw = exported.content
+            with tarfile.open(fileobj=BytesIO(raw), mode="r:gz") as src:
+                xml_member = src.extractfile("faceIDs/userdata.xml")
+                if xml_member is not None:
+                    root = ET.fromstring(xml_member.read())
+                    for key in root.findall("Key"):
+                        try:
+                            max_face = max(max_face, int(key.get("FaceID") or 0))
+                        except (TypeError, ValueError):
+                            pass
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Não foi possível ler FaceID do export: %s", exc)
+        return max_face + 1
+
+    def _put_register_img(self, face_id: int, jpeg_bytes: bytes) -> str:
+        path = f"/Image/RegisterImg/{face_id}.jpg"
+        last_error: Optional[Exception] = None
+        with self._client() as client:
+            for verb in (client.put, client.post):
+                try:
+                    response = verb(
+                        self._url(path),
+                        content=jpeg_bytes,
+                        headers={"Content-Type": "image/jpeg"},
+                    )
+                    if response.status_code in {200, 201, 204}:
+                        return f"{self.base_url}{path}"
+                    last_error = DeviceError(
+                        f"HTTP {response.status_code}: {response.text[:120]}"
+                    )
+                except httpx.HTTPError as exc:
+                    last_error = exc
+        raise DeviceError(f"Não foi possível gravar {path}: {last_error}")
+
+    def _send_face_via_register_img(
+        self,
+        *,
+        registration: str,
+        name: str,
+        jpeg_path: Path,
+        device_user_id: int,
+    ) -> None:
+        face_id = self._next_face_id()
+        img_url = self._put_register_img(face_id, Path(jpeg_path).read_bytes())
+        self.update_user(
+            device_user_id=device_user_id,
+            registration=registration,
+            name=name,
+            face_public_url=img_url,
+        )
+
+    def _send_face_via_multipart(
+        self,
+        *,
+        device_user_id: int,
+        registration: str,
+        name: str,
+        jpeg_path: Path,
+    ) -> None:
+        jpeg_bytes = Path(jpeg_path).read_bytes()
+        form_base = {
+            "target": "user",
+            "action": "set",
+            "ID": str(device_user_id),
+            "UserID": registration,
+            "Name": name.strip()[:60],
+        }
+        last_error: Optional[Exception] = None
+        with self._client() as client:
+            for field in ("Face", "face", "File", "file", "image", "Image"):
+                try:
+                    response = client.post(
+                        self._url("/api/user/set"),
+                        data=form_base,
+                        files={field: ("face.jpg", jpeg_bytes, "image/jpeg")},
+                    )
+                    response.raise_for_status()
+                    self._check(response.json(), f"user/set multipart ({field})")
+                    return
+                except Exception as exc:  # noqa: BLE001
+                    last_error = exc
+        raise DeviceError(f"Upload multipart da face rejeitado: {last_error}")
 
     def _attach_face_via_import(
         self,
@@ -241,6 +472,7 @@ class IntelbrasClient:
         device_user_id: int,
     ) -> None:
         jpeg_bytes = Path(jpeg_path).read_bytes()
+        time.sleep(0.5)
         with self._client() as client:
             exported = client.get(self._url("/api/user/export"))
             exported.raise_for_status()
@@ -477,7 +709,6 @@ class IntelbrasClient:
         face_public_url: Optional[str] = None,
     ) -> CreatedUser:
         """Atualiza a foto facial de um membro já cadastrado (ou recria se sumiu)."""
-        _ = face_public_url
         jpeg_path = _ensure_jpeg_file(image_path)
         existing = self.find_user_by_registration(registration)
         if existing:
@@ -487,6 +718,7 @@ class IntelbrasClient:
                 name=name,
                 jpeg_path=jpeg_path,
                 device_user_id=device_id,
+                face_public_url=face_public_url,
             )
             try:
                 self._grant_always_access(
@@ -497,15 +729,18 @@ class IntelbrasClient:
                 )
             except DeviceError as exc:
                 logger.warning("Relé permitido / validade sempre não confirmados: %s", exc)
+            if not face_ok:
+                raise DeviceError(FACE_NOT_ACCEPTED_MSG)
             return CreatedUser(
                 device_user_id=device_id,
                 registration=registration,
-                face_ok=face_ok,
+                face_ok=True,
             )
         return self.create_user_with_face(
             name,
             jpeg_path,
             registration=registration,
+            face_public_url=face_public_url,
             image_ready=True,
         )
 
@@ -540,25 +775,37 @@ class IntelbrasClient:
         self.ping()
         existing = self.find_user_by_registration(registration)
         if existing:
-            if image_path or face_public_url:
-                self.update_user(
-                    device_user_id=int(existing["ID"]),
+            device_id = int(existing["ID"])
+            face_ok = True
+            if image_path:
+                face_ok = self._send_face(
                     registration=registration,
                     name=name,
-                    image_path=image_path,
+                    jpeg_path=_ensure_jpeg_file(image_path),
+                    device_user_id=device_id,
                     face_public_url=face_public_url,
                 )
+            elif face_public_url:
+                self.update_user(
+                    device_user_id=device_id,
+                    registration=registration,
+                    name=name,
+                    face_public_url=face_public_url,
+                )
+                face_ok = self._face_confirmed(registration)
             try:
                 self._grant_always_access(
-                    device_user_id=int(existing["ID"]),
+                    device_user_id=device_id,
                     registration=registration,
                     name=name,
                     current=existing,
                 )
             except DeviceError as exc:
                 logger.warning("Relé permitido / validade sempre não confirmados: %s", exc)
+            if image_path and not face_ok:
+                raise DeviceError(FACE_NOT_ACCEPTED_MSG)
             return CreatedUser(
-                device_user_id=int(existing["ID"]),
+                device_user_id=device_id,
                 registration=registration,
                 face_ok=True,
             )
@@ -801,7 +1048,13 @@ class DeviceFleet:
 
 
 def public_media_url(filename: str) -> str:
-    return f"http://{SERVER_LAN_IP}:{PORT}/media/{filename}"
+    from app.config import reload_env
+
+    reload_env()
+    ip = os.getenv("SERVER_LAN_IP", SERVER_LAN_IP).strip()
+    if not ip:
+        return ""
+    return f"http://{ip}:{PORT}/media/{filename}"
 
 
 def _ensure_jpeg_file(image_path: Path) -> Path:

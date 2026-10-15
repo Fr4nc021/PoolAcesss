@@ -2,6 +2,7 @@
 {% block title %}ADM — Acesso Piscinas Clube Aliança{% endblock %}
 
 {% block content %}
+<div id="cloud-alert" class="flash flash-error" role="alert"{% if not sync_status.cloud_alert %} hidden{% endif %}>{{ sync_status.cloud_alert }}</div>
 <section class="panel">
   <div class="panel-head">
     <div>
@@ -10,10 +11,14 @@
         Resumo do acesso às piscinas. Clique em um cartão para abrir a lista correspondente.
       </p>
     </div>
-    <form method="post" action="{{ url_for('main.adm_sincronizar_logs') }}">
-      <button type="submit" class="btn btn-secondary">Sincronizar logs do XPE</button>
-    </form>
+    <div class="panel-actions">
+      <button type="button" class="btn btn-secondary" id="btn-test-sync">Testar sincronização</button>
+      <form method="post" action="{{ url_for('main.adm_sincronizar_logs') }}">
+        <button type="submit" class="btn btn-secondary">Sincronizar logs do XPE</button>
+      </form>
+    </div>
   </div>
+  <div id="sync-test" class="sync-test" hidden aria-live="polite"></div>
 
   {% if sync_note %}
   <p class="hint sync-note">{{ sync_note }}</p>
@@ -444,5 +449,97 @@
   const initial = (location.hash || "#socios").replace("#", "");
   showTab(initial, { updateHash: false });
   applyMemberFilters();
+
+  const cloudAlert = document.getElementById("cloud-alert");
+  const cloudStatus = document.getElementById("cloud-status");
+  const peerStatus = document.getElementById("peer-status");
+  const syncTest = document.getElementById("sync-test");
+  const syncTestButton = document.getElementById("btn-test-sync");
+
+  function syncLine(title, item) {
+    const line = document.createElement("p");
+    line.className = (item && item.css) || "";
+    const name = document.createElement("strong");
+    name.textContent = `${title}: `;
+    line.append(name, document.createTextNode((item && item.detail) || ""));
+    return line;
+  }
+
+  function paintSyncStatus(data) {
+    if (peerStatus && data.peer) {
+      peerStatus.className = data.peer.css || "";
+      peerStatus.textContent = `Outro PC: ${data.peer.label || ""}`;
+    }
+    if (cloudStatus && data.cloud) {
+      cloudStatus.className = data.cloud.css || "";
+      cloudStatus.textContent = `Nuvem: ${data.cloud.label || ""}`;
+    }
+    if (!cloudAlert || !data.cloud) return;
+    const failed = data.cloud.configured && !data.cloud.ok;
+    cloudAlert.hidden = !failed;
+    cloudAlert.textContent = failed ? (data.cloud.detail || "") : "";
+  }
+
+  if (syncTestButton) {
+    syncTestButton.addEventListener("click", async () => {
+      syncTestButton.disabled = true;
+      syncTestButton.textContent = "Testando…";
+      if (syncTest) {
+        syncTest.hidden = false;
+        syncTest.replaceChildren();
+        const waiting = document.createElement("p");
+        waiting.textContent = "Testando o outro PC e a nuvem…";
+        syncTest.append(waiting);
+      }
+      try {
+        const response = await fetch("/adm/testar-sync", {
+          method: "POST",
+          headers: { Accept: "application/json" },
+        });
+        const data = await response.json();
+        if (!syncTest) return;
+        syncTest.replaceChildren();
+        if (!response.ok || !data.peer || !data.cloud) {
+          const error = document.createElement("p");
+          error.className = "is-bad";
+          error.textContent = data.error || "Não foi possível testar a sincronização.";
+          syncTest.append(error);
+          return;
+        }
+        syncTest.append(syncLine("Outro PC", data.peer), syncLine("Nuvem", data.cloud));
+        paintSyncStatus(data);
+      } catch (_error) {
+        if (!syncTest) return;
+        syncTest.replaceChildren();
+        const error = document.createElement("p");
+        error.className = "is-bad";
+        error.textContent = "Não foi possível testar a sincronização.";
+        syncTest.append(error);
+      } finally {
+        syncTestButton.disabled = false;
+        syncTestButton.textContent = "Testar sincronização";
+      }
+    });
+  }
+
+  async function refreshCloudStatus() {
+    try {
+      const response = await fetch("/sync/painel", { headers: { Accept: "application/json" } });
+      if (!response.ok) return;
+      const data = await response.json();
+      if (cloudStatus) {
+        cloudStatus.className = data.cloud_class || "";
+        cloudStatus.textContent = `Nuvem: ${data.cloud || ""}`;
+      }
+      if (!cloudAlert) return;
+      const message = (data.cloud_alert || "").trim();
+      cloudAlert.hidden = !message;
+      cloudAlert.textContent = message;
+    } catch (_error) {
+      // Mantém o aviso já mostrado nesta página.
+    }
+  }
+
+  setInterval(refreshCloudStatus, 15000);
 </script>
 {% endblock %}
