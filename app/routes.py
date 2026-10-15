@@ -31,6 +31,7 @@ from app.config import (
     sync_settings,
 )
 from app.intelbras_client import DeviceError, DeviceFleet, fleet_for_pool, public_media_url
+from app.netcheck import lan_ip_problem
 from app import updater
 from app.sync import build_state, request_sync, run_sync_cycle, status_view
 from app.tray import schedule_close_prompt
@@ -309,6 +310,10 @@ def cadastrar():
     if not _allowed_file(photo.filename):
         return fail("Formato de foto inválido. Use JPG ou PNG.")
 
+    ip_problem = lan_ip_problem()
+    if ip_problem:
+        return fail(f"Cadastro não enviado. {ip_problem}", 500)
+
     try:
         photo_path = _save_upload(photo, name)
     except Exception as exc:
@@ -526,6 +531,11 @@ def adm_atualizar_foto(member_id: int):
         flash("Formato de foto inválido. Use JPG ou PNG.", "error")
         return _redirect_adm("socios")
 
+    ip_problem = lan_ip_problem()
+    if ip_problem and not member.access_blocked and not member.is_expired:
+        flash(f"Foto não enviada. {ip_problem}", "error")
+        return _redirect_adm("socios")
+
     try:
         photo_path = _save_upload(photo, member.name)
     except Exception as exc:
@@ -669,13 +679,15 @@ def saude():
     if request.args.get("rapido"):
         # O atualizador usa esta forma: responde sem consultar os faciais.
         return jsonify({"app": "ok", "version": VERSION})
+    ip_problem = lan_ip_problem()
     status = {
         "app": "ok",
         "device": None,
         "devices": [],
         "error": None,
         "media_base": None,
-        "server_lan_ip_ok": bool(public_media_url("teste.jpg")),
+        "server_lan_ip_ok": not ip_problem,
+        "server_lan_ip_problem": ip_problem or None,
         "version": VERSION,
     }
     try:
@@ -686,7 +698,7 @@ def saude():
             status["error"] = (
                 (status.get("error") or "")
                 + ("; " if status.get("error") else "")
-                + "SERVER_LAN_IP vazio no .env — o facial não consegue baixar fotos deste PC"
+                + ip_problem
             ).strip("; ")
         online = [item for item in devices if item.get("ok")]
         if online and len(online) == len(devices):

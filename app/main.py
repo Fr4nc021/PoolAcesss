@@ -19,6 +19,7 @@ from app.config import (
     sync_settings,
 )
 from app.expiry import start_expiry_worker
+from app.netcheck import lan_ip_problem
 from app.routes import bp
 from app.shortcut import ensure_desktop_shortcut
 from app.sync import start_sync_worker, status_view
@@ -69,6 +70,7 @@ def create_app() -> Flask:
             "update_result": update_result(),
             "app_version": VERSION,
             "is_local_request": request.remote_addr in {"127.0.0.1", "::1"},
+            "lan_ip_warning": lan_ip_problem(),
         }
 
     return app

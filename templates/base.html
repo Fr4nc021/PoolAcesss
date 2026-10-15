@@ -28,6 +28,9 @@
       </p>
     </header>
 
+    {% if lan_ip_warning %}
+      <div class="flash flash-error" role="alert" id="lan-ip-warning">{{ lan_ip_warning }}</div>
+    {% endif %}
     {% if update_result and not update_result.ok %}
       <div class="flash flash-error" role="alert">{{ update_result.message }}</div>
     {% endif %}
