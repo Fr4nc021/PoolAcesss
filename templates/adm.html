@@ -13,12 +13,19 @@
     </div>
     <div class="panel-actions">
       <button type="button" class="btn btn-secondary" id="btn-test-sync">Testar sincronização</button>
+      {% if is_local_request %}
+      <button type="button" class="btn btn-secondary" id="btn-test-validity">Testar validade no facial</button>
+      {% endif %}
       <form method="post" action="{{ url_for('main.adm_sincronizar_logs') }}">
         <button type="submit" class="btn btn-secondary">Sincronizar logs do XPE</button>
       </form>
     </div>
   </div>
   <div id="sync-test" class="sync-test" hidden aria-live="polite"></div>
+  <div id="validity-test" class="sync-test" hidden aria-live="polite">
+    <p>Resultado do teste de validade. Copie todo o texto abaixo e envie para análise.</p>
+    <textarea id="validity-result" rows="12" readonly></textarea>
+  </div>
 
   {% if sync_note %}
   <p class="hint sync-note">{{ sync_note }}</p>
@@ -455,6 +462,29 @@
   const peerStatus = document.getElementById("peer-status");
   const syncTest = document.getElementById("sync-test");
   const syncTestButton = document.getElementById("btn-test-sync");
+  const validityButton = document.getElementById("btn-test-validity");
+  if (validityButton) {
+    validityButton.addEventListener("click", async () => {
+      if (!window.confirm(
+        "O teste cria um usuário TESTE VALIDADE sem foto em cada facial, tenta gravar uma data de validade e apaga o usuário no final. Nenhum sócio é alterado. Continuar?"
+      )) return;
+      const box = document.getElementById("validity-test");
+      const out = document.getElementById("validity-result");
+      validityButton.disabled = true;
+      box.hidden = false;
+      out.value = "Testando os faciais...";
+      try {
+        const response = await fetch("/adm/testar-validade", {
+          method: "POST",
+          headers: { Accept: "application/json", "X-Acesso-Local": "1" },
+        });
+        out.value = JSON.stringify(await response.json(), null, 2);
+      } catch (err) {
+        out.value = "Falha no teste: " + (err.message || err);
+      }
+      validityButton.disabled = false;
+    });
+  }
 
   function syncLine(title, item) {
     const line = document.createElement("p");
