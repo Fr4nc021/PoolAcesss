@@ -1,0 +1,5 @@
+# Nome local do projeto para a CLI. O ref remoto entra no `supabase link`.
+project_id = "acesso-piscinas"
+
+[functions.heartbeat]
+verify_jwt = false

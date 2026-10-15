@@ -59,3 +59,6 @@ Desktop.ini
 htmlcov/
 .mypy_cache/
 .ruff_cache/
+
+# --- Supabase CLI (local) ---
+supabase/.temp/

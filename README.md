@@ -62,6 +62,8 @@ Cada PC roda o programa e guarda o próprio banco. Na rede do clube, um puxa o o
 
 O topo da tela mostra **Outro PC** e **Nuvem**. Sem `SYNC_PEER_URL` ou sem `SUPABASE_URL`, aquele caminho fica desligado e o restante do programa segue igual.
 
+O projeto na nuvem também precisa de um ping diário para não pausar por inatividade. Isso fica fora do programa do clube. Veja [docs/heartbeat.md](docs/heartbeat.md).
+
 ---
 
 ## Instalação (Windows)
@@ -120,6 +122,8 @@ AcessoPiscinas/
 ├── static/              # CSS / assets
 ├── data/                # DB e fotos (local; não versionado)
 ├── scripts/             # Utilitários / diagnóstico
+├── supabase/functions/  # Heartbeat (Edge Function)
+├── docs/heartbeat.md    # Cron e secrets do heartbeat
 ├── .env.example         # Modelo de configuração (sem segredos)
 ├── INSTALAR.bat
 ├── INICIAR.bat
