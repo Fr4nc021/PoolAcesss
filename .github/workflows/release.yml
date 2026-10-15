@@ -27,16 +27,17 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -r requirements.txt pyinstaller
 
-      - name: Recusar segredos no checkout
+      - name: Recusar segredos no repositório
         shell: bash
         run: |
           set -euo pipefail
-          for path in .env env.txt data; do
-            if [ -e "$path" ]; then
-              echo "::error::$path não pode existir no repositório."
-              exit 1
-            fi
-          done
+          # data/.gitkeep só mantém a pasta no git. Banco, fotos e configuração não podem estar versionados.
+          bad="$(git ls-files | grep -E '(^|/)(\.env|env\.txt)$|^data/|\.db$' | grep -v '^data/\.gitkeep$' || true)"
+          if [ -n "$bad" ]; then
+            echo "::error::Arquivos que não podem estar no repositório:"
+            echo "$bad"
+            exit 1
+          fi
 
       - name: Gerar executáveis
         run: |
