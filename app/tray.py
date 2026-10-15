@@ -156,15 +156,39 @@ def _confirm_update(icon, _item) -> None:
         _message_info(str(exc))
 
 
+UPDATE_SYNC_SECONDS = 20
+
+
 def shutdown_for_update() -> None:
-    """Fecha para o atualizador trocar os arquivos. Sincroniza antes, como sempre."""
+    """Fecha para o atualizador trocar os arquivos.
+
+    Sincroniza por no máximo 20 segundos: o banco fica no PC e a próxima
+    abertura termina a troca com o outro PC e a nuvem.
+    """
+    global _closing
+    with _close_lock:
+        _closing = True
     icon = _tray_icon
     if icon is not None:
         try:
             icon.title = "Atualizando..."
         except Exception:  # noqa: BLE001
             pass
-    _shutdown(icon)
+
+    def _sync() -> None:
+        try:
+            from app.sync import run_sync_cycle
+
+            run_sync_cycle()
+        except Exception:
+            logger.exception("Falha ao sincronizar antes de atualizar")
+
+    worker = threading.Thread(target=_sync, name="sync-before-update", daemon=True)
+    worker.start()
+    worker.join(UPDATE_SYNC_SECONDS)
+    if worker.is_alive():
+        logger.warning("Sincronização ainda em andamento; fechando para atualizar mesmo assim")
+    os._exit(0)
 
 
 def _message_yes_no(text: str) -> bool:
