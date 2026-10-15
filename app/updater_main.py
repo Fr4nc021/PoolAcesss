@@ -101,13 +101,6 @@ def _retry(action: Callable[[], None], what: str, attempts: int = 10) -> None:
             time.sleep(1.0)
 
 
-def _remove(path: Path) -> None:
-    if path.is_dir() and not path.is_symlink():
-        shutil.rmtree(path)
-    elif path.exists() or path.is_symlink():
-        path.unlink()
-
-
 def backup_database(install_dir: Path, backup_dir: Path) -> list[str]:
     saved: list[str] = []
     data_dir = install_dir / "data"
@@ -133,14 +126,19 @@ def restore_database(install_dir: Path, backup_dir: Path, saved: list[str]) -> N
 
 
 class Swap:
-    """Troca os itens do topo da pasta e lembra o que fazer para desfazer."""
+    """Troca arquivo por arquivo e lembra o que fazer para desfazer.
+
+    Não move pastas: o Windows recusa mover uma pasta aberta no Explorador
+    ou sendo lida pelo antivírus, mas aceita trocar os arquivos dentro dela.
+    """
 
     def __init__(self, install_dir: Path, staging_dir: Path, backup_dir: Path) -> None:
         self.install_dir = install_dir
         self.staging_dir = staging_dir
         self.app_backup = backup_dir / "app"
-        self.moved: list[str] = []
-        self.created: list[str] = []
+        self.replaced: list[str] = []
+        self.added: list[str] = []
+        self.removed: list[str] = []
 
     def names(self) -> list[str]:
         names = sorted(item.name for item in self.staging_dir.iterdir())
@@ -149,31 +147,77 @@ class Swap:
                 raise ValueError(f"Item protegido na pasta da atualização: {name}")
         return names
 
+    def new_files(self) -> list[str]:
+        files: list[str] = []
+        for name in self.names():
+            source = self.staging_dir / name
+            if source.is_dir():
+                files.extend(
+                    path.relative_to(self.staging_dir).as_posix()
+                    for path in sorted(source.rglob("*"))
+                    if path.is_file()
+                )
+            else:
+                files.append(name)
+        return files
+
+    def _put(self, source: Path, target: Path, what: str) -> None:
+        """Copia ao lado e troca de nome: o arquivo nunca fica pela metade."""
+        target.parent.mkdir(parents=True, exist_ok=True)
+        temp = target.with_name(target.name + ".novo")
+        shutil.copy2(source, temp)
+        _retry(lambda: os.replace(temp, target), what)
+
     def apply(self) -> None:
         self.app_backup.mkdir(parents=True, exist_ok=True)
-        for name in self.names():
-            current = self.install_dir / name
-            if current.exists() or current.is_symlink():
-                _retry(lambda c=current, n=name: os.replace(c, self.app_backup / n), name)
-                self.moved.append(name)
-            source = self.staging_dir / name
-            self.created.append(name)
-            if source.is_dir():
-                shutil.copytree(source, current)
+        new_files = self.new_files()
+        for rel in new_files:
+            target = self.install_dir / rel
+            if target.is_file():
+                backup = self.app_backup / rel
+                backup.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(target, backup)
+                self.replaced.append(rel)
             else:
-                shutil.copy2(source, current)
-            log(f"Trocado: {name}")
+                self.added.append(rel)
+            self._put(self.staging_dir / rel, target, rel)
+        log(f"Arquivos trocados: {len(self.replaced)}, novos: {len(self.added)}")
+
+        # Sobras da versão anterior dentro das pastas trocadas (ex.: _internal).
+        keep = set(new_files)
+        for name in self.names():
+            folder = self.install_dir / name
+            if not (self.staging_dir / name).is_dir() or not folder.is_dir():
+                continue
+            for path in sorted(folder.rglob("*")):
+                rel = path.relative_to(self.install_dir).as_posix()
+                if not path.is_file() or rel in keep:
+                    continue
+                backup = self.app_backup / rel
+                backup.parent.mkdir(parents=True, exist_ok=True)
+                try:
+                    os.replace(path, backup)
+                    self.removed.append(rel)
+                except OSError as exc:
+                    log(f"Sobra antiga mantida ({rel}): {exc}")
 
     def rollback(self) -> None:
-        for name in reversed(self.created):
-            target = self.install_dir / name
-            if target.exists() or target.is_symlink():
-                _retry(lambda t=target: _remove(t), name)
-        for name in reversed(self.moved):
-            _retry(
-                lambda n=name: os.replace(self.app_backup / n, self.install_dir / n),
-                name,
-            )
+        for rel in reversed(self.added):
+            target = self.install_dir / rel
+            if target.exists():
+                _retry(lambda t=target: t.unlink(), rel)
+        for rel in reversed(self.replaced):
+            self._put(self.app_backup / rel, self.install_dir / rel, rel)
+        for rel in reversed(self.removed):
+            target = self.install_dir / rel
+            target.parent.mkdir(parents=True, exist_ok=True)
+            _retry(lambda r=rel, t=target: os.replace(self.app_backup / r, t), rel)
+        # Pastas que só a versão nova criou.
+        for rel in sorted({str(Path(r).parent) for r in self.added}, key=len, reverse=True):
+            folder = self.install_dir / rel
+            while folder != self.install_dir and folder.is_dir() and not any(folder.iterdir()):
+                folder.rmdir()
+                folder = folder.parent
         log("Arquivos da versão anterior restaurados")
 
 

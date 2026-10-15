@@ -644,6 +644,17 @@ def fechar_aba():
     return ("", 204)
 
 
+@bp.post("/adm/testar-validade")
+def adm_testar_validade():
+    """Teste do formato de data de validade nos faciais. Só pelo próprio PC."""
+    if not _local_admin_request():
+        return jsonify({"ok": False, "error": "Rode o teste no PC onde o programa está aberto."}), 403
+    from app.validity_probe import run_probe
+
+    reports = [run_probe(client) for client in DeviceFleet().clients]
+    return jsonify({"ok": True, "version": VERSION, "relatorios": reports})
+
+
 @bp.get("/atualizacao/estado")
 def atualizacao_estado():
     """Versão e estado da atualização. Não tem dados de sócios nem chaves."""

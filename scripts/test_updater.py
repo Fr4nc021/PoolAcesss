@@ -316,6 +316,65 @@ def test_updater_does_nothing_if_app_stays_open() -> None:
         assert (install / "AcessoPiscinas.exe").read_text() == "velho"
 
 
+def _hold_folder(folder: Path):
+    """Abre a pasta como o Explorador faz: o Windows passa a recusar movê-la."""
+    import ctypes
+    from ctypes import wintypes
+
+    create = ctypes.windll.kernel32.CreateFileW
+    create.restype = wintypes.HANDLE
+    handle = create(str(folder), 0x80000000, 0x1 | 0x2, None, 3, 0x02000000, None)
+    if handle == wintypes.HANDLE(-1).value:
+        raise OSError("não abriu a pasta")
+    return handle
+
+
+def test_updater_works_while_internal_folder_is_open() -> None:
+    if os.name != "nt":
+        return
+    import ctypes
+
+    with tempfile.TemporaryDirectory() as tmp:
+        install, staging = _install_layout(Path(tmp))
+        (install / "_internal" / "sobra-antiga.pyd").write_text("velha")
+        plan = _plan(install, staging)
+        updater_main.wait_for_exit = lambda pid, timeout: True
+        updater_main.start_app = lambda d, exe: object()
+        updater_main.time.sleep = lambda s: None
+        handle = _hold_folder(install / "_internal")
+        try:
+            try:
+                os.replace(install / "_internal", Path(tmp) / "movida")
+            except OSError:
+                pass
+            else:
+                raise AssertionError("o teste precisa de uma pasta que o Windows não deixa mover")
+            assert updater_main.run(plan, health=lambda *a: True)
+        finally:
+            ctypes.windll.kernel32.CloseHandle(handle)
+        assert (install / "_internal" / "lib.dll").read_text() == "lib nova"
+        assert not (install / "_internal" / "sobra-antiga.pyd").exists()
+        _untouched(install)
+
+
+def test_rollback_brings_back_removed_leftovers() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        install, staging = _install_layout(Path(tmp))
+        (install / "_internal" / "sobra-antiga.pyd").write_text("velha")
+        (staging / "_internal" / "novo" ).mkdir()
+        (staging / "_internal" / "novo" / "mod.pyd").write_text("novo")
+        plan = _plan(install, staging)
+        updater_main.wait_for_exit = lambda pid, timeout: True
+        updater_main.start_app = lambda d, exe: object()
+        updater_main._stop = lambda process: None
+        updater_main.time.sleep = lambda s: None
+        assert not updater_main.run(plan, health=lambda *a: False)
+        assert (install / "_internal" / "sobra-antiga.pyd").read_text() == "velha"
+        assert (install / "_internal" / "lib.dll").read_text() == "lib velha"
+        assert not (install / "_internal" / "novo").exists()
+        assert not list(install.rglob("*.novo"))
+
+
 def test_plan_rejects_paths_outside_update_dir() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         install, staging = _install_layout(Path(tmp))
@@ -455,6 +514,8 @@ def main() -> None:
     test_updater_swaps_and_keeps_protected_files()
     test_updater_rolls_back_when_health_fails()
     test_updater_does_nothing_if_app_stays_open()
+    test_updater_works_while_internal_folder_is_open()
+    test_rollback_brings_back_removed_leftovers()
     test_plan_rejects_paths_outside_update_dir()
     test_install_route_is_local_only_and_blocked_during_registration()
     print("updater ok")

@@ -836,3 +836,9 @@ body {
 .app-footer .is-ok {
   color: var(--ok);
 }
+
+#validity-result {
+  width: 100%;
+  font-family: Consolas, "Courier New", monospace;
+  font-size: 0.8rem;
+}

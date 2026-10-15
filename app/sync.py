@@ -5,7 +5,7 @@ import logging
 import threading
 import time
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Optional
 from urllib.parse import quote
@@ -33,6 +33,11 @@ _labels: dict[str, Optional[str]] = {
 _bucket_ready = False
 
 PHOTO_BUCKET = "fotos"
+# Fotos sem sócio na nuvem são apagadas uma vez por dia. A folga de 1 hora
+# protege a foto que acabou de subir e ainda espera o registro do sócio.
+ORPHAN_SWEEP_SECONDS = 24 * 60 * 60
+ORPHAN_MIN_AGE_SECONDS = 60 * 60
+_last_orphan_sweep = 0.0
 
 
 @dataclass
@@ -559,6 +564,8 @@ def _push_cloud(
                 chunk,
             )
 
+        _sweep_orphan_photos(client, base_url, key)
+
 
 def _apply_remote_member(
     remote: MemberSnapshot,
@@ -659,13 +666,117 @@ def _apply_deletion_list(items: object) -> dict[str, datetime]:
 
 
 def _delete_cloud_member(client: httpx.Client, base_url: str, key: str, registration: str) -> None:
+    """Apaga o sócio da nuvem e a foto dele, se nenhum outro sócio usar a mesma."""
+    headers = _cloud_headers(key, json_body=False)
+    lookup = client.get(
+        f"{base_url}/rest/v1/members",
+        params={"registration": f"eq.{registration}", "select": "photo_sha256"},
+        headers=headers,
+    )
+    digest: Optional[str] = None
+    if lookup.status_code == 200:
+        rows = lookup.json()
+        if isinstance(rows, list) and rows and isinstance(rows[0], dict):
+            digest = rows[0].get("photo_sha256") or None
     response = client.delete(
         f"{base_url}/rest/v1/members",
         params={"registration": f"eq.{registration}"},
-        headers=_cloud_headers(key, json_body=False),
+        headers=headers,
     )
     if response.status_code not in {200, 204, 404}:
         response.raise_for_status()
+    if digest:
+        try:
+            _delete_photo_if_unused(client, base_url, key, digest)
+        except httpx.HTTPError as exc:
+            # A limpeza diária tenta de novo. A exclusão do sócio já valeu.
+            logger.warning("Foto de %s não foi apagada da nuvem agora: %s", registration, exc)
+
+
+def _delete_photo_if_unused(client: httpx.Client, base_url: str, key: str, digest: str) -> None:
+    headers = _cloud_headers(key, json_body=False)
+    users = client.get(
+        f"{base_url}/rest/v1/members",
+        params={"photo_sha256": f"eq.{digest}", "select": "registration", "limit": 1},
+        headers=headers,
+    )
+    users.raise_for_status()
+    if users.json():
+        return
+    _delete_photo_object(client, base_url, key, f"{digest}.jpg")
+
+
+def _delete_photo_object(client: httpx.Client, base_url: str, key: str, name: str) -> None:
+    response = client.delete(
+        f"{base_url}/storage/v1/object/{PHOTO_BUCKET}/{quote(name)}",
+        headers=_cloud_headers(key, json_body=False),
+    )
+    if response.status_code not in {200, 204, 400, 404}:
+        response.raise_for_status()
+    logger.info("Foto apagada da nuvem: %s", name)
+
+
+def _list_photo_objects(client: httpx.Client, base_url: str, key: str) -> list[dict]:
+    objects: list[dict] = []
+    offset = 0
+    while True:
+        response = client.post(
+            f"{base_url}/storage/v1/object/list/{PHOTO_BUCKET}",
+            headers=_cloud_headers(key),
+            json={
+                "prefix": "",
+                "limit": 1000,
+                "offset": offset,
+                "sortBy": {"column": "name", "order": "asc"},
+            },
+        )
+        response.raise_for_status()
+        batch = response.json()
+        if not isinstance(batch, list):
+            return objects
+        objects.extend(item for item in batch if isinstance(item, dict))
+        if len(batch) < 1000:
+            return objects
+        offset += 1000
+
+
+def _sweep_orphan_photos(
+    client: httpx.Client,
+    base_url: str,
+    key: str,
+    *,
+    now: Optional[float] = None,
+) -> int:
+    """Apaga da nuvem fotos que nenhum sócio usa (exclusões antigas, foto trocada)."""
+    global _last_orphan_sweep
+    now = time.time() if now is None else now
+    if now - _last_orphan_sweep < ORPHAN_SWEEP_SECONDS:
+        return 0
+    try:
+        members = _paged(client, f"{base_url}/rest/v1/members", _cloud_headers(key))
+        used = {str(row.get("photo_sha256")) for row in members if row.get("photo_sha256")}
+        removed = 0
+        for item in _list_photo_objects(client, base_url, key):
+            name = str(item.get("name") or "")
+            digest = name[:-4] if name.endswith(".jpg") else ""
+            if len(digest) != 64 or digest in used:
+                continue
+            created = _parse_iso(item.get("created_at"))
+            # A nuvem grava created_at em UTC.
+            if (
+                created is None
+                or now - created.replace(tzinfo=timezone.utc).timestamp() < ORPHAN_MIN_AGE_SECONDS
+            ):
+                continue
+            _delete_photo_object(client, base_url, key, name)
+            removed += 1
+    except (httpx.HTTPError, ValueError, RuntimeError) as exc:
+        logger.warning("Limpeza de fotos sem sócio na nuvem falhou: %s", exc)
+        return 0
+    _last_orphan_sweep = now
+    if removed:
+        logger.info("Fotos sem sócio apagadas da nuvem: %s", removed)
+    return removed
 
 
 def _apply_pending_unblocks() -> None:

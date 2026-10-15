@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 import sys
 import tempfile
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -316,6 +316,92 @@ def test_http_estado_requires_token() -> None:
                 expiry._thread.join(timeout=3)
 
 
+class _FakeCloud:
+    """Supabase de mentira: tabela members e bucket de fotos em memória."""
+
+    def __init__(self, members: list[dict], objects: dict[str, str]) -> None:
+        self.members = members
+        self.objects = objects
+        self.deleted: list[str] = []
+
+    def handler(self, request):
+        import httpx
+
+        path = request.url.path
+        params = dict(request.url.params)
+        if path == "/rest/v1/members" and request.method == "GET":
+            rows = self.members
+            if "registration" in params:
+                rows = [r for r in rows if f"eq.{r['registration']}" == params["registration"]]
+            if "photo_sha256" in params:
+                rows = [r for r in rows if f"eq.{r.get('photo_sha256')}" == params["photo_sha256"]]
+            if params.get("offset") not in (None, "0"):
+                rows = []
+            return httpx.Response(200, json=rows)
+        if path == "/rest/v1/members" and request.method == "DELETE":
+            reg = params["registration"][3:]
+            self.members = [r for r in self.members if r["registration"] != reg]
+            return httpx.Response(204)
+        if path == "/storage/v1/object/list/fotos":
+            return httpx.Response(
+                200,
+                json=[{"name": name, "created_at": created} for name, created in self.objects.items()],
+            )
+        if path.startswith("/storage/v1/object/fotos/") and request.method == "DELETE":
+            name = path.rsplit("/", 1)[1]
+            self.objects.pop(name, None)
+            self.deleted.append(name)
+            return httpx.Response(200, json=[])
+        return httpx.Response(404)
+
+
+def test_cloud_photo_is_deleted_with_member() -> None:
+    import httpx
+
+    import app.sync as sync
+
+    shared, own = "a" * 64, "b" * 64
+    cloud = _FakeCloud(
+        [
+            {"registration": "AP1", "photo_sha256": own},
+            {"registration": "AP2", "photo_sha256": shared},
+            {"registration": "AP3", "photo_sha256": shared},
+        ],
+        {f"{own}.jpg": "2026-01-01T00:00:00Z", f"{shared}.jpg": "2026-01-01T00:00:00Z"},
+    )
+    with httpx.Client(transport=httpx.MockTransport(cloud.handler), base_url="https://x") as client:
+        sync._delete_cloud_member(client, "https://x", "chave", "AP1")
+        assert cloud.deleted == [f"{own}.jpg"], cloud.deleted
+        sync._delete_cloud_member(client, "https://x", "chave", "AP2")
+        assert f"{shared}.jpg" in cloud.objects, "AP3 ainda usa a mesma foto"
+        sync._delete_cloud_member(client, "https://x", "chave", "AP3")
+        assert f"{shared}.jpg" not in cloud.objects
+
+
+def test_orphan_photo_sweep() -> None:
+    import httpx
+
+    import app.sync as sync
+
+    used, old_orphan, new_orphan = "c" * 64, "d" * 64, "e" * 64
+    now = datetime(2026, 10, 15, 12, 0, 0).timestamp()
+    cloud = _FakeCloud(
+        [{"registration": "AP1", "photo_sha256": used}],
+        {
+            f"{used}.jpg": "2026-01-01T00:00:00Z",
+            f"{old_orphan}.jpg": "2026-01-01T00:00:00Z",
+            f"{new_orphan}.jpg": datetime.fromtimestamp(now - 60, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "outro-arquivo.txt": "2026-01-01T00:00:00Z",
+        },
+    )
+    sync._last_orphan_sweep = 0.0
+    with httpx.Client(transport=httpx.MockTransport(cloud.handler), base_url="https://x") as client:
+        assert sync._sweep_orphan_photos(client, "https://x", "chave", now=now) == 1
+        assert cloud.deleted == [f"{old_orphan}.jpg"]
+        assert sync._sweep_orphan_photos(client, "https://x", "chave", now=now + 60) == 0, "só uma vez por dia"
+    sync._last_orphan_sweep = 0.0
+
+
 def main() -> None:
     test_renewal_clears_stale_block()
     test_manual_block_with_same_expiry_wins()
@@ -326,6 +412,8 @@ def main() -> None:
     test_sync_button_reports_missing_config()
     test_sync_button_explains_rejected_token()
     test_http_estado_requires_token()
+    test_cloud_photo_is_deleted_with_member()
+    test_orphan_photo_sweep()
     print("sync ok")
 
 
