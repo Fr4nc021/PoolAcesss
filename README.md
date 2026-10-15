@@ -64,6 +64,8 @@ O topo da tela mostra **Outro PC** e **Nuvem**. Sem `SYNC_PEER_URL` ou sem `SUPA
 
 O projeto na nuvem também precisa de um ping diário para não pausar por inatividade. Isso fica fora do programa do clube. Veja [docs/heartbeat.md](docs/heartbeat.md).
 
+O programa instalado se atualiza pelo GitHub Releases, com pacote assinado e volta automática se a versão nova não abrir. Como publicar uma versão: [docs/atualizacao.md](docs/atualizacao.md).
+
 ---
 
 ## Instalação (Windows)
@@ -124,6 +126,7 @@ AcessoPiscinas/
 ├── scripts/             # Utilitários / diagnóstico
 ├── supabase/functions/  # Heartbeat (Edge Function)
 ├── docs/heartbeat.md    # Cron e secrets do heartbeat
+├── docs/atualizacao.md  # Publicar versão e atualização automática
 ├── .env.example         # Modelo de configuração (sem segredos)
 ├── INSTALAR.bat
 ├── INICIAR.bat
