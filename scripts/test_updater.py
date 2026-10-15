@@ -16,6 +16,8 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from app import updater_main
+
+_REAL_WAIT_FOR_EXIT = updater_main.wait_for_exit
 from app.update_core import (
     APP_NAME,
     UpdateError,
@@ -375,6 +377,28 @@ def test_rollback_brings_back_removed_leftovers() -> None:
         assert not list(install.rglob("*.novo"))
 
 
+def test_updater_kills_app_stuck_syncing() -> None:
+    import subprocess
+
+    stuck = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"])
+    with tempfile.TemporaryDirectory() as tmp:
+        install, staging = _install_layout(Path(tmp))
+        plan = _plan(install, staging)
+        plan.pid = stuck.pid
+        updater_main.wait_for_exit = _REAL_WAIT_FOR_EXIT
+        updater_main.start_app = lambda d, exe: object()
+        old_wait, old_kill = updater_main.WAIT_EXIT_SECONDS, updater_main.KILL_WAIT_SECONDS
+        updater_main.WAIT_EXIT_SECONDS, updater_main.KILL_WAIT_SECONDS = 1, 10
+        try:
+            assert updater_main.run(plan, health=lambda *a: True)
+        finally:
+            updater_main.WAIT_EXIT_SECONDS, updater_main.KILL_WAIT_SECONDS = old_wait, old_kill
+            if stuck.poll() is None:
+                stuck.kill()
+        assert stuck.poll() is not None, "o programa antigo preso precisa ser encerrado"
+        assert (install / "AcessoPiscinas.exe").read_text() == "novo"
+
+
 def test_plan_rejects_paths_outside_update_dir() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         install, staging = _install_layout(Path(tmp))
@@ -516,6 +540,7 @@ def main() -> None:
     test_updater_does_nothing_if_app_stays_open()
     test_updater_works_while_internal_folder_is_open()
     test_rollback_brings_back_removed_leftovers()
+    test_updater_kills_app_stuck_syncing()
     test_plan_rejects_paths_outside_update_dir()
     test_install_route_is_local_only_and_blocked_during_registration()
     print("updater ok")

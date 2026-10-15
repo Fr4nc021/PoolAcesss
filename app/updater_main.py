@@ -24,8 +24,12 @@ from typing import Callable, Optional
 
 PROTECTED_NAMES = frozenset({"data", ".env", "env.txt", "_update"})
 DB_FILES = ("acessopiscinas.db", "acessopiscinas.db-wal", "acessopiscinas.db-shm")
-WAIT_EXIT_SECONDS = 120
-HEALTH_SECONDS = 90
+# O programa sincroniza antes de fechar. Num PC lento, ou com a nuvem lenta,
+# isso demora: depois deste prazo o atualizador encerra o processo antigo.
+WAIT_EXIT_SECONDS = 60
+KILL_WAIT_SECONDS = 20
+# PC lento e antivírus lendo os arquivos novos atrasam a primeira abertura.
+HEALTH_SECONDS = 240
 
 _log_path: Optional[Path] = None
 
@@ -86,6 +90,29 @@ def wait_for_exit(pid: int, timeout: float) -> bool:
             return True
         time.sleep(0.5)
     return False
+
+
+def terminate_process(pid: int) -> None:
+    """Encerra o programa antigo que não fechou sozinho (ficou preso sincronizando)."""
+    if os.name == "nt":
+        import ctypes
+
+        terminate = 0x0001
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.OpenProcess(terminate, False, pid)
+        if not handle:
+            return
+        try:
+            kernel32.TerminateProcess(handle, 1)
+        finally:
+            kernel32.CloseHandle(handle)
+        return
+    import signal
+
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except OSError:
+        pass
 
 
 def _retry(action: Callable[[], None], what: str, attempts: int = 10) -> None:
@@ -291,10 +318,13 @@ def _cleanup_after_success(plan: Plan, keep: Path) -> None:
 def run(plan: Plan, *, health: Callable[..., bool] = health_ok) -> bool:
     log(f"Atualizando {plan.from_version} -> {plan.to_version} em {plan.install_dir}")
     if not wait_for_exit(plan.pid, WAIT_EXIT_SECONDS):
-        message = "O programa não fechou a tempo. Nada foi trocado."
-        log(message)
-        _write_result(plan, False, message)
-        return False
+        log(f"O programa não fechou em {WAIT_EXIT_SECONDS}s; encerrando o processo antigo")
+        terminate_process(plan.pid)
+        if not wait_for_exit(plan.pid, KILL_WAIT_SECONDS):
+            message = "O programa não fechou a tempo. Nada foi trocado."
+            log(message)
+            _write_result(plan, False, message)
+            return False
     time.sleep(1.0)
 
     backup_dir = plan.backup_root / datetime.now().strftime("%Y%m%d-%H%M%S")
