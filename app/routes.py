@@ -23,8 +23,10 @@ from werkzeug.utils import secure_filename
 from app import db, exam_test
 from app.config import (
     PHOTOS_DIR,
+    EXPIRY_HOUR,
     VALIDITY_DAYS,
     ensure_directories,
+    exam_expires_from,
     normalize_pool_ids,
     pool_label,
     registration_pools,
@@ -291,6 +293,7 @@ def cadastrar():
         return render_template(
             "cadastrar.html",
             validity_days=VALIDITY_DAYS,
+        expiry_hour=EXPIRY_HOUR,
             app_title=APP_TITLE,
             pools=registration_pools(),
         )
@@ -340,7 +343,7 @@ def cadastrar():
             photo_path,
             face_public_url=face_url,
         )
-        expires_at = datetime.now() + timedelta(days=VALIDITY_DAYS)
+        expires_at = exam_expires_from(datetime.now())
         member = db.create_member(
             name=name,
             registration=created.registration,
@@ -390,6 +393,7 @@ def membros():
         "membros.html",
         members=members,
         validity_days=VALIDITY_DAYS,
+        expiry_hour=EXPIRY_HOUR,
         app_title=APP_TITLE,
     )
 
@@ -416,7 +420,7 @@ def renovar(member_id: int):
             previous_device_user_id=member.device_user_id,
             face_public_url=face_url,
         )
-        new_expires = datetime.now() + timedelta(days=VALIDITY_DAYS)
+        new_expires = exam_expires_from(datetime.now())
         updated = db.renew_member(member_id, expires_at=new_expires)
         if updated and created.device_user_id != member.device_user_id:
             db.update_device_user_id(member_id, created.device_user_id)
@@ -472,6 +476,7 @@ def adm():
         "adm.html",
         app_title=APP_TITLE,
         validity_days=VALIDITY_DAYS,
+        expiry_hour=EXPIRY_HOUR,
         sync_note=sync_note,
         stats={
             "total_members": total_members,
