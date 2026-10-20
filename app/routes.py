@@ -28,9 +28,16 @@ from app.config import (
     normalize_pool_ids,
     pool_label,
     registration_pools,
+    selected_pools,
     sync_settings,
 )
-from app.intelbras_client import DeviceError, DeviceFleet, fleet_for_pool, public_media_url
+from app.intelbras_client import (
+    DeviceError,
+    DeviceFleet,
+    IntelbrasClient,
+    fleet_for_pool,
+    public_media_url,
+)
 from app.netcheck import lan_ip_problem
 from app import updater
 from app.sync import build_state, request_sync, run_sync_cycle, status_view
@@ -479,12 +486,13 @@ def adm():
         expiring_members=db.list_expiring_soon(7),
         blocked_members=db.list_blocked_members(),
         all_members=db.list_members(),
+        pools=registration_pools(),
         approved_events=db.list_access_events(limit=40, result="approved"),
         denied_events=db.list_access_events(limit=40, result="denied"),
         blocked_events=db.list_access_events(limit=40, result="blocked"),
         change_events=db.list_access_events(
             limit=40,
-            results=["registered", "renewed", "photo_updated", "deleted"],
+            results=["registered", "renewed", "photo_updated", "pool_updated", "deleted"],
         ),
         test_members=_test_members(),
         now_input=now.strftime("%Y-%m-%dT%H:%M"),
@@ -595,6 +603,89 @@ def adm_atualizar_foto(member_id: int):
 
     request_sync()
     flash(f"Foto de {member.name} confirmada no Intelbras.", "success")
+    return _redirect_adm("socios")
+
+
+def _pool_urls(pool: Optional[str]) -> dict[str, str]:
+    """URL do facial -> nome da piscina. Sem piscina gravada vale as duas."""
+    chosen = selected_pools(pool) or registration_pools()
+    return {item["url"]: item["label"] for item in chosen}
+
+
+@bp.post("/adm/membros/<int:member_id>/piscinas")
+@_blocks_update
+def adm_piscinas(member_id: int):
+    """Troca as piscinas do sócio sem mudar matrícula, foto nem exame."""
+    member = db.get_member(member_id)
+    if member is None:
+        flash("Membro não encontrado.", "error")
+        return _redirect_adm("socios")
+
+    pool = normalize_pool_ids(request.form.getlist("pool"))
+    if pool is None:
+        flash("Selecione ao menos uma piscina: normal, térmica ou as duas.", "error")
+        return _redirect_adm("socios")
+
+    old_urls = _pool_urls(member.pool)
+    new_urls = _pool_urls(pool)
+    added = [url for url in new_urls if url not in old_urls]
+    removed = [url for url in old_urls if url not in new_urls]
+    if not added and not removed:
+        flash(f"{member.name} já está em: {pool_label(pool)}.", "success")
+        return _redirect_adm("socios")
+
+    # Bloqueado ou vencido não tem face nos faciais: só grava a escolha.
+    active = not member.access_blocked and not member.is_expired
+    if active and added:
+        photo = Path(member.photo_path) if member.photo_path else None
+        if photo is None or not photo.is_file():
+            flash(
+                f"A foto de {member.name} não está neste PC. Troque a foto antes de incluir outra piscina.",
+                "error",
+            )
+            return _redirect_adm("socios")
+        face_url = public_media_url(photo.name)
+        try:
+            for url in added:
+                IntelbrasClient(base_url=url).renew_member(
+                    name=member.name,
+                    registration=member.registration,
+                    image_path=photo,
+                    face_public_url=face_url,
+                )
+        except DeviceError as exc:
+            logger.exception("Falha ao incluir sócio em outra piscina")
+            flash(f"Não foi possível incluir em {new_urls[url]}: {exc}", "error")
+            return _redirect_adm("socios")
+
+    failed: list[str] = []
+    for url in removed:
+        try:
+            IntelbrasClient(base_url=url).delete_user(registration=member.registration)
+        except DeviceError as exc:
+            logger.error("Falha ao tirar %s de %s: %s", member.registration, url, exc)
+            failed.append(old_urls[url])
+    if failed:
+        # Quem não saiu do facial continua com a piscina dele no cadastro.
+        kept = [item["id"] for item in registration_pools() if item["label"] in failed]
+        pool = normalize_pool_ids(pool.split(",") + kept) or pool
+
+    db.set_member_pool(member_id, pool)
+    db.log_access_event(
+        result="pool_updated",
+        member_name=member.name,
+        registration=member.registration,
+        detail=f"{pool_label(member.pool)} → {pool_label(pool)}",
+    )
+    request_sync()
+    if failed:
+        flash(
+            f"Não foi possível tirar {member.name} de {', '.join(failed)}. "
+            f"Cadastro ficou em: {pool_label(pool)}. Tente de novo com o facial ligado.",
+            "error",
+        )
+    else:
+        flash(f"Piscinas de {member.name} alteradas para: {pool_label(pool)}.", "success")
     return _redirect_adm("socios")
 
 
