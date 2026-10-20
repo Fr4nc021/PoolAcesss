@@ -9,7 +9,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Iterator, Optional
 
-from app.config import DB_PATH, VALIDITY_DAYS, ensure_directories, pool_label
+from app.config import DB_PATH, EXPIRY_HOUR, ensure_directories, exam_expires_from, pool_label
 
 
 def _connect() -> sqlite3.Connection:
@@ -98,6 +98,7 @@ def init_db() -> None:
         )
         _backfill_photo_hashes(conn)
         _backfill_event_sync_ids(conn)
+        _align_expiry_hour(conn)
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS member_deletions (
@@ -125,6 +126,25 @@ def file_sha256(path: Optional[str]) -> Optional[str]:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _align_expiry_hour(conn: sqlite3.Connection) -> None:
+    """Exame que vence antes da EXPIRY_HOUR passa a vencer nessa hora, no mesmo dia.
+
+    Só empurra para mais tarde, então a sincronização (que fica com a data
+    mais longa) aceita a mudança nos dois PCs e na nuvem. Bloqueados ficam
+    como estão para não parecerem válidos de novo.
+    """
+    cutoff = f"{EXPIRY_HOUR:02d}:00:00"
+    conn.execute(
+        """
+        UPDATE members
+        SET medical_exam_expires_at = substr(medical_exam_expires_at, 1, 10) || 'T' || ?
+        WHERE access_blocked = 0
+          AND substr(medical_exam_expires_at, 12, 8) < ?
+        """,
+        (cutoff, cutoff),
+    )
 
 
 def _backfill_photo_hashes(conn: sqlite3.Connection) -> None:
@@ -295,7 +315,7 @@ def create_member(
     pool: Optional[str] = None,
 ) -> Member:
     now = datetime.now()
-    expires = expires_at or (now + timedelta(days=VALIDITY_DAYS))
+    expires = expires_at or exam_expires_from(now)
     digest = file_sha256(photo_path)
     with get_connection() as conn:
         cur = conn.execute(
@@ -441,7 +461,7 @@ def update_device_user_id(member_id: int, device_user_id: int) -> None:
 
 def renew_member(member_id: int, expires_at: Optional[datetime] = None) -> Optional[Member]:
     now = datetime.now()
-    expires = expires_at or (now + timedelta(days=VALIDITY_DAYS))
+    expires = expires_at or exam_expires_from(now)
     with get_connection() as conn:
         cur = conn.execute(
             """

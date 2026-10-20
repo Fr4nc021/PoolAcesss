@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import logging
 import threading
+from datetime import datetime
 from typing import Optional
 
 from app import db
-from app.config import EXPIRY_CHECK_MINUTES
+from app.config import EXPIRY_CHECK_MINUTES, next_expiry_time
 from app.intelbras_client import DeviceError, DeviceFleet, IntelbrasClient, fleet_for_pool
 
 logger = logging.getLogger(__name__)
@@ -74,6 +75,13 @@ def sync_expired_members(client: Optional[IntelbrasClient] = None) -> int:
     return blocked
 
 
+def _seconds_until_next_check(interval: int, now: Optional[datetime] = None) -> float:
+    """Checa no intervalo normal, mas também logo depois da hora do vencimento."""
+    now = now or datetime.now()
+    until_expiry = (next_expiry_time(now) - now).total_seconds() + 5
+    return max(1.0, min(float(interval), until_expiry))
+
+
 def _worker() -> None:
     interval = max(1, EXPIRY_CHECK_MINUTES) * 60
     logger.info("Checagem de vencimentos iniciada (intervalo=%ss)", interval)
@@ -82,7 +90,7 @@ def _worker() -> None:
     except Exception:
         logger.exception("Erro na checagem inicial de vencimentos")
 
-    while not _stop_event.wait(interval):
+    while not _stop_event.wait(_seconds_until_next_check(interval)):
         try:
             sync_expired_members()
         except Exception:

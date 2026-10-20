@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import sys
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
@@ -194,6 +195,20 @@ def _int_env(name: str, default: int) -> int:
 
 VALIDITY_DAYS = _int_env("VALIDITY_DAYS", 30)
 EXPIRY_CHECK_MINUTES = _int_env("EXPIRY_CHECK_MINUTES", 15)
+# Hora do dia em que o exame vence. Todos que vencem no mesmo dia caem juntos.
+EXPIRY_HOUR = min(23, max(0, _int_env("EXPIRY_HOUR", 22)))
+
+
+def exam_expires_from(start: datetime) -> datetime:
+    """Fim da validade de um exame confirmado em start: VALIDITY_DAYS depois, na EXPIRY_HOUR."""
+    day = start + timedelta(days=VALIDITY_DAYS)
+    return day.replace(hour=EXPIRY_HOUR, minute=0, second=0, microsecond=0)
+
+
+def next_expiry_time(now: datetime) -> datetime:
+    """Próxima vez que o relógio passa pela EXPIRY_HOUR."""
+    today = now.replace(hour=EXPIRY_HOUR, minute=0, second=0, microsecond=0)
+    return today if today > now else today + timedelta(days=1)
 HOST = os.getenv("HOST", "0.0.0.0")
 PORT = _int_env("PORT", 5000)
 SECRET_KEY = os.getenv("SECRET_KEY", "acessopiscinas-dev")
