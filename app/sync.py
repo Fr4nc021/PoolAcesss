@@ -12,7 +12,7 @@ from urllib.parse import quote
 
 import httpx
 
-from app import db
+from app import db, exam_test
 from app.config import sync_settings
 from app.intelbras_client import DeviceError, fleet_for_pool, public_media_url
 
@@ -150,7 +150,11 @@ def status_view() -> dict[str, str]:
 
 def build_state() -> dict:
     return {
-        "members": [member_payload(member) for member in db.list_members()],
+        "members": [
+            member_payload(member)
+            for member in db.list_members()
+            if not exam_test.is_held(member.registration)
+        ],
         "events": [event_payload(event) for event in db.list_events_for_sync()],
         "deletions": [
             {"registration": registration, "deleted_at": _iso(deleted_at)}
@@ -533,6 +537,8 @@ def _push_cloud(
             )
 
         for member in db.list_members():
+            if exam_test.is_held(member.registration):
+                continue
             deleted_at = db.get_deletion(member.registration)
             if deleted_at and deleted_at >= member.updated_at:
                 continue
@@ -571,6 +577,8 @@ def _apply_remote_member(
     remote: MemberSnapshot,
     fetch_photo: Callable[[], Optional[bytes]],
 ) -> None:
+    if exam_test.is_held(remote.registration):
+        return
     deleted_at = db.get_deletion(remote.registration)
     if deleted_at and deleted_at >= remote.updated_at.replace(microsecond=0):
         db.record_deletion(remote.registration, deleted_at)

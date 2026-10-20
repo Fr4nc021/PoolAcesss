@@ -70,6 +70,11 @@
     <button type="button" class="adm-tab" role="tab" id="tab-acessos" aria-selected="false" aria-controls="panel-acessos" data-tab="acessos">
       Acessos
     </button>
+    {% if is_local_request %}
+    <button type="button" class="adm-tab" role="tab" id="tab-teste" aria-selected="false" aria-controls="panel-teste" data-tab="teste">
+      Teste{% if test_members %} <span class="tab-count">{{ test_members|length }}</span>{% endif %}
+    </button>
+    {% endif %}
   </div>
 
   <div class="adm-panel" id="panel-socios" role="tabpanel" aria-labelledby="tab-socios" data-panel="socios">
@@ -355,10 +360,86 @@
       {% endif %}
     </div>
   </div>
+
+  {% if is_local_request %}
+  <div class="adm-panel" id="panel-teste" role="tabpanel" aria-labelledby="tab-teste" data-panel="teste" hidden>
+    <h2>Teste de vencimento</h2>
+    <p class="lead">
+      Mude a data do exame de um sócio para ver o bloqueio no facial. A checagem automática roda a cada
+      15 minutos; use “Rodar checagem agora” para não esperar. Quem está em teste fica só neste PC
+      e não vai para o outro PC nem para a nuvem. Ao encerrar, a data original volta e, se ainda valer,
+      a face volta para o facial. Fechar o programa também encerra os testes.
+    </p>
+
+    {% if all_members %}
+    <form id="test-form" class="test-form">
+      <label>
+        <span>Sócio</span>
+        <select name="member_id" required>
+          <option value="">Escolha…</option>
+          {% for m in all_members %}
+          <option value="{{ m.id }}">{{ m.name }} ({{ m.registration }}) — até {{ m.medical_exam_expires_at.strftime('%d/%m/%Y %H:%M') }}</option>
+          {% endfor %}
+        </select>
+      </label>
+      <label>
+        <span>Exame vale até</span>
+        <input type="datetime-local" name="expires_at" value="{{ now_input }}" required>
+      </label>
+      <div class="test-presets" role="group" aria-label="Atalhos de data">
+        <button type="button" class="filter-btn" data-offset-min="-1">Venceu há 1 min</button>
+        <button type="button" class="filter-btn" data-offset-min="2">Vence em 2 min</button>
+        <button type="button" class="filter-btn" data-offset-min="1440">Amanhã</button>
+      </div>
+      <div class="test-actions">
+        <button type="submit" class="btn btn-primary">Gravar data</button>
+        <button type="button" class="btn btn-secondary" id="btn-test-check">Rodar checagem agora</button>
+      </div>
+    </form>
+    <p class="hint test-error is-bad" id="test-error" hidden></p>
+    {% else %}
+    <p class="empty">Nenhum sócio cadastrado ainda.</p>
+    {% endif %}
+
+    <h3 class="subhead">Em teste</h3>
+    {% if test_members %}
+    <div class="table-wrap">
+      <table class="members-table">
+        <thead>
+          <tr>
+            <th>Nome</th>
+            <th>Data original</th>
+            <th>Data de teste</th>
+            <th>Status</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for row in test_members %}
+          {% set m = row.member %}
+          <tr>
+            <td>{{ m.name }}</td>
+            <td>{{ row.original.strftime('%d/%m/%Y %H:%M') }}</td>
+            <td>{{ m.medical_exam_expires_at.strftime('%d/%m/%Y %H:%M') }}</td>
+            <td><span class="badge {{ m.status_class }}">{{ m.status_label }}</span></td>
+            <td class="actions">
+              <button type="button" class="btn btn-secondary btn-sm" data-test-end="{{ m.id }}"
+                      data-confirm="Encerrar o teste de {{ m.name }} e voltar o exame para {{ row.original.strftime('%d/%m/%Y %H:%M') }}?">Encerrar teste</button>
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    {% else %}
+    <p class="empty">Nenhum sócio em teste.</p>
+    {% endif %}
+  </div>
+  {% endif %}
 </section>
 
 <script>
-  const tabNames = ["socios", "vencimentos", "acessos"];
+  const tabNames = ["socios", "vencimentos", "acessos", "teste"];
   const tabButtons = Array.from(document.querySelectorAll(".adm-tab"));
   const panels = Array.from(document.querySelectorAll("[data-panel]"));
 
@@ -485,6 +566,62 @@
       validityButton.disabled = false;
     });
   }
+
+  const testForm = document.getElementById("test-form");
+  const testError = document.getElementById("test-error");
+
+  async function postTest(url, body) {
+    if (testError) testError.hidden = true;
+    try {
+      const response = await fetch(url, {
+        method: "POST",
+        headers: { Accept: "application/json", "Content-Type": "application/json", "X-Acesso-Local": "1" },
+        body: JSON.stringify(body || {}),
+      });
+      const data = await response.json();
+      if (!response.ok || !data.ok) throw new Error(data.error || "Falha no teste.");
+      location.hash = "#teste";
+      location.reload();
+    } catch (err) {
+      if (!testError) return;
+      testError.textContent = err.message || String(err);
+      testError.hidden = false;
+    }
+  }
+
+  function toLocalInput(date) {
+    const pad = (n) => String(n).padStart(2, "0");
+    return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`;
+  }
+
+  if (testForm) {
+    testForm.querySelectorAll("[data-offset-min]").forEach((button) => {
+      button.addEventListener("click", () => {
+        const when = new Date(Date.now() + Number(button.dataset.offsetMin) * 60000);
+        testForm.elements.expires_at.value = toLocalInput(when);
+      });
+    });
+    testForm.addEventListener("submit", (event) => {
+      event.preventDefault();
+      postTest("/adm/teste/data", {
+        member_id: testForm.elements.member_id.value,
+        expires_at: testForm.elements.expires_at.value,
+      });
+    });
+    document.getElementById("btn-test-check")?.addEventListener("click", (event) => {
+      event.currentTarget.disabled = true;
+      event.currentTarget.textContent = "Checando…";
+      postTest("/adm/teste/checar");
+    });
+  }
+
+  document.querySelectorAll("[data-test-end]").forEach((button) => {
+    button.addEventListener("click", () => {
+      if (!window.confirm(button.dataset.confirm)) return;
+      button.disabled = true;
+      postTest(`/adm/teste/${button.dataset.testEnd}/encerrar`);
+    });
+  });
 
   function syncLine(title, item) {
     const line = document.createElement("p");
