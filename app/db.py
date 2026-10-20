@@ -549,6 +549,35 @@ def _record_deletion(conn: sqlite3.Connection, registration: str, deleted_at: da
     )
 
 
+def set_exam_expiry(
+    member_id: int,
+    expires_at: datetime,
+    *,
+    unblock: bool = False,
+) -> Optional[Member]:
+    """Grava a data do exame sem registrar renovação. Usado pela aba Teste."""
+    now = datetime.now()
+    with get_connection() as conn:
+        cur = conn.execute(
+            """
+            UPDATE members
+            SET medical_exam_expires_at = ?,
+                access_blocked = CASE WHEN ? THEN 0 ELSE access_blocked END,
+                updated_at = ?
+            WHERE id = ?
+            """,
+            (
+                expires_at.isoformat(timespec="seconds"),
+                1 if unblock else 0,
+                now.isoformat(timespec="seconds"),
+                member_id,
+            ),
+        )
+        if cur.rowcount == 0:
+            return None
+    return get_member(member_id)
+
+
 def mark_blocked(member_id: int) -> None:
     now = datetime.now()
     with get_connection() as conn:
