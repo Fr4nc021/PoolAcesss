@@ -231,6 +231,7 @@ class AccessEvent:
             "renewed": "Renovado",
             "registered": "Cadastrado",
             "photo_updated": "Foto atualizada",
+            "pool_updated": "Piscinas alteradas",
             "deleted": "Excluído",
             "deleted": "Excluído",
         }
@@ -238,7 +239,7 @@ class AccessEvent:
 
     @property
     def result_class(self) -> str:
-        if self.result in {"approved", "renewed", "registered", "photo_updated"}:
+        if self.result in {"approved", "renewed", "registered", "photo_updated", "pool_updated"}:
             return "status-ok"
         if self.result in {"denied", "blocked", "deleted"}:
             return "status-expired"
@@ -547,6 +548,18 @@ def _record_deletion(conn: sqlite3.Connection, registration: str, deleted_at: da
         """,
         (registration, stamp),
     )
+
+
+def set_member_pool(member_id: int, pool: str) -> Optional[Member]:
+    now = datetime.now()
+    with get_connection() as conn:
+        cur = conn.execute(
+            "UPDATE members SET pool = ?, updated_at = ? WHERE id = ?",
+            (pool, now.isoformat(timespec="seconds"), member_id),
+        )
+        if cur.rowcount == 0:
+            return None
+    return get_member(member_id)
 
 
 def set_exam_expiry(

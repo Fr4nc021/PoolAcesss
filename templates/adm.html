@@ -140,6 +140,12 @@
                   <button type="submit" class="btn btn-secondary btn-sm">Bloquear</button>
                 </form>
                 {% endif %}
+                <form>
+                  <button type="button" class="btn btn-secondary btn-sm" data-pool-edit
+                          data-action="{{ url_for('main.adm_piscinas', member_id=m.id) }}"
+                          data-name="{{ m.name }}"
+                          data-pools="{{ m.pool or pools|map(attribute='id')|join(',') }}">Piscinas</button>
+                </form>
                 <form method="post" enctype="multipart/form-data" action="{{ url_for('main.adm_atualizar_foto', member_id=m.id) }}">
                   <label class="btn btn-secondary btn-sm file-btn">
                     Foto
@@ -160,6 +166,23 @@
       </table>
     </div>
     <p class="empty" id="adm-no-results" hidden>Nenhum sócio encontrado com esse filtro.</p>
+
+    <dialog id="pool-dialog" class="pool-dialog">
+      <form method="post" id="pool-form">
+        <h3>Piscinas de <span id="pool-name"></span></h3>
+        <p class="hint">Matrícula, foto e exame continuam iguais. A face entra ou sai dos faciais na hora.</p>
+        {% for p in pools %}
+        <label class="pool-option">
+          <input type="checkbox" name="pool" value="{{ p.id }}">
+          <span>{{ p.label }}</span>
+        </label>
+        {% endfor %}
+        <div class="pool-dialog-actions">
+          <button type="button" class="btn btn-secondary" id="pool-cancel">Cancelar</button>
+          <button type="submit" class="btn btn-primary">Salvar</button>
+        </div>
+      </form>
+    </dialog>
     {% else %}
     <p class="empty">Nenhum sócio cadastrado ainda.</p>
     {% endif %}
@@ -507,6 +530,27 @@
   memberSearch?.addEventListener("input", applyMemberFilters);
   memberFilters.forEach((button) => {
     button.addEventListener("click", () => setMemberFilter(button.dataset.filter));
+  });
+
+  const poolDialog = document.getElementById("pool-dialog");
+  const poolForm = document.getElementById("pool-form");
+  document.querySelectorAll("[data-pool-edit]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const current = (button.dataset.pools || "").split(",");
+      poolForm.action = button.dataset.action;
+      document.getElementById("pool-name").textContent = button.dataset.name;
+      poolForm.querySelectorAll('input[name="pool"]').forEach((box) => {
+        box.checked = current.includes(box.value);
+      });
+      poolDialog.showModal();
+    });
+  });
+  document.getElementById("pool-cancel")?.addEventListener("click", () => poolDialog.close());
+  poolForm?.addEventListener("submit", (event) => {
+    if (!poolForm.querySelector('input[name="pool"]:checked')) {
+      event.preventDefault();
+      window.alert("Selecione ao menos uma piscina.");
+    }
   });
 
   const accessButtons = Array.from(document.querySelectorAll(".access-filter"));

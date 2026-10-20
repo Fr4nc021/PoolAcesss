@@ -879,3 +879,32 @@ body {
 .test-error {
   color: #b42318;
 }
+
+.pool-dialog {
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  padding: 1.25rem;
+  width: min(26rem, calc(100vw - 2rem));
+}
+
+.pool-dialog::backdrop {
+  background: rgba(15, 30, 40, 0.4);
+}
+
+.pool-dialog h3 {
+  margin: 0 0 0.5rem;
+}
+
+.pool-option {
+  display: flex;
+  gap: 0.6rem;
+  align-items: center;
+  padding: 0.5rem 0;
+}
+
+.pool-dialog-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 0.5rem;
+  margin-top: 1rem;
+}
