@@ -11,7 +11,7 @@ Quando o exame vence, o sistema remove o usuário do equipamento automaticamente
 ## Funcionalidades
 
 - Cadastro de membro com nome + foto → envia face ao equipamento
-- Controle de validade (padrão: **30 dias**)
+- Controle de validade (padrão: **30 dias**, vencendo às **22h** do último dia)
 - Renovação ao confirmar exame médico (`+VALIDITY_DAYS`)
 - Remoção automática no equipamento quando o exame expira
 - Endpoint de saúde para diagnóstico
@@ -34,7 +34,7 @@ Quando o exame vence, o sistema remove o usuário do equipamento automaticamente
 copy .env.example .env
 ```
 
-2. Edite o `.env` com os dados do **seu** ambiente:
+2. Edite o `.env` com os dados do **seu** ambiente. Depois da primeira abertura, faciais, IP deste PC, outro PC e nuvem também podem ser trocados em **ADM > Configurações** (engrenagem), no próprio PC, sem abrir o arquivo e sem reiniciar:
 
 | Variável | Descrição |
 |----------|-----------|
@@ -43,6 +43,7 @@ copy .env.example .env
 | `SERVER_LAN_IP` | IP deste PC na LAN (para o equipamento baixar fotos) |
 | `SECRET_KEY` | Chave Flask — use um valor único em produção |
 | `VALIDITY_DAYS` | Dias de validade após o exame (padrão 30) |
+| `EXPIRY_HOUR` | Hora em que o exame vence no último dia (padrão 22). Todos que vencem no dia caem juntos |
 | `DOOR_NUM` | Canal OpenDoor no equipamento |
 | `SYNC_PEER_URL` | Endereço do outro PC, ex.: `http://192.168.x.x:5000` |
 | `SYNC_TOKEN` | Segredo igual nos dois PCs para a troca na rede local |

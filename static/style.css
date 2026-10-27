@@ -908,3 +908,117 @@ body {
   gap: 0.5rem;
   margin-top: 1rem;
 }
+
+.adm-tab-config {
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+.removal,
+.members-table td.when {
+  white-space: nowrap;
+}
+
+.removal.is-done {
+  color: var(--muted);
+}
+
+.removal.is-late {
+  color: var(--err);
+  font-weight: 600;
+}
+
+.expiry-form .field input,
+.config-form .field input {
+  width: 100%;
+  font: inherit;
+  color: var(--ink);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: #fff;
+  padding: 0.7rem 0.9rem;
+}
+
+.expiry-form .test-presets {
+  margin-top: 0.75rem;
+}
+
+.config-form {
+  display: grid;
+  gap: 1rem;
+}
+
+.config-card {
+  margin: 0;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: #fff;
+  padding: 1rem 1.1rem 1.1rem;
+  display: grid;
+  gap: 0.75rem;
+  min-width: 0;
+}
+
+.config-card legend {
+  font-weight: 700;
+  padding: 0 0.35rem;
+}
+
+.config-card .hint {
+  margin: 0;
+}
+
+.config-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(15rem, 1fr));
+  gap: 0.75rem 1rem;
+}
+
+.config-info {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 0.3rem 1rem;
+  margin: 0;
+}
+
+.config-info dt {
+  color: var(--muted);
+  font-size: 0.9rem;
+}
+
+.config-info dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.config-actions,
+.config-save {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  align-items: center;
+}
+
+.config-save {
+  justify-content: flex-end;
+}
+
+.config-card .sync-test {
+  margin: 0;
+}
+
+.input-row {
+  display: flex;
+  gap: 0.5rem;
+}
+
+.input-row input {
+  flex: 1;
+  min-width: 0;
+}
+
+.hint.is-bad {
+  color: var(--err);
+}

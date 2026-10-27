@@ -37,6 +37,9 @@ class FakeFleet:
     def status(self) -> list[dict]:
         return [{"ok": True, "url": self.base_url}]
 
+    def ping(self) -> dict:
+        return {"retcode": 0}
+
     def block_user(self, *, device_user_id: int, registration: str) -> None:
         self.users.discard(registration)
 
@@ -85,8 +88,11 @@ def test_tab_blocks_and_restores() -> None:
     past = (datetime.now() - timedelta(minutes=1)).strftime("%Y-%m-%dT%H:%M")
     response = client.post("/adm/teste/data", json={"member_id": member.id, "expires_at": past}, headers=LOCAL)
     assert response.get_json()["ok"], response.get_json()
+    assert response.get_json()["blocked"], "data vencida bloqueia na hora"
     assert exam_test.is_held("T001")
     assert db.get_member(member.id).is_expired
+    assert db.get_member(member.id).access_blocked
+    assert "T001" not in fleet.users, "face saiu do facial sem esperar a checagem"
 
     state = sync.build_state()
     assert all(item["registration"] != "T001" for item in state["members"]), "não vai para o outro PC"
@@ -105,9 +111,8 @@ def test_tab_blocks_and_restores() -> None:
     assert db.get_member(member.id).is_expired, "outro PC não desfaz a data de teste"
 
     response = client.post("/adm/teste/checar", headers=LOCAL)
-    assert response.get_json()["blocked"] == 1
+    assert response.get_json()["blocked"] == 0, "já estava bloqueado"
     assert db.get_member(member.id).access_blocked
-    assert "T001" not in fleet.users, "face saiu do facial"
 
     page = client.get("/adm").get_data(as_text=True)
     assert original.strftime("%d/%m/%Y %H:%M") in page, "lista mostra a data original"

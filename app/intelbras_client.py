@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import logging
 import os
 import tarfile
+import threading
 import time
+import uuid
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -13,12 +16,9 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 import httpx
-from PIL import Image
+from PIL import Image, ImageOps
 
 from app.config import (
-    DEVICE_LOGIN,
-    DEVICE_PASSWORD,
-    DEVICE_URL,
     DOOR_NUM,
     PORT,
     SERVER_LAN_IP,
@@ -35,6 +35,16 @@ FACE_VALIDITY_ALWAYS = "0"
 FACE_SEND_ROUNDS = 3
 FACE_CONFIRM_RETRIES = 8
 FACE_CONFIRM_DELAY = 1.5
+FACE_MIN_SIDE = 250
+FACE_MAX_SIDE = 800
+FACE_MIN_BYTES = 1000
+FACE_MAX_BYTES = 2 * 1024 * 1024
+DELETE_CONFIRM_RETRIES = 4
+DELETE_CONFIRM_DELAY = 1.0
+USER_PAGE_LIMIT = 50
+
+# Modelo do rosto no export: () = sem modelo, None = export indisponível.
+FaceSignature = Optional[tuple[str, ...]]
 
 FACE_NOT_ACCEPTED_MSG = (
     "A foto não foi aceita pelo equipamento Intelbras. "
@@ -43,16 +53,6 @@ FACE_NOT_ACCEPTED_MSG = (
 )
 
 logger = logging.getLogger(__name__)
-
-
-def _mark_face_always(key: ET.Element) -> None:
-    """Relé local permitido e termo de validade Sempre (não Agenda)."""
-    key.set("Relay", "1")
-    key.set("WebRelay", "0")
-    key.set("Validity", FACE_VALIDITY_ALWAYS)
-    key.set("Frequency", "0")
-    for child in list(key.findall("Schedule")):
-        key.remove(child)
 
 
 class DeviceError(Exception):
@@ -71,14 +71,20 @@ class IntelbrasClient:
 
     def __init__(
         self,
-        base_url: str = DEVICE_URL,
-        login: str = DEVICE_LOGIN,
-        password: str = DEVICE_PASSWORD,
+        base_url: Optional[str] = None,
+        login: Optional[str] = None,
+        password: Optional[str] = None,
         timeout: float = 60.0,
     ) -> None:
+        # Sem valor, lê o env.txt agora: a aba Configurações muda login e senha sem reiniciar.
+        from app.config import reload_env
+
+        reload_env()
+        if base_url is None:
+            base_url = os.getenv("DEVICE_URL", "")
         self.base_url = base_url.rstrip("/")
-        self.login_name = login
-        self.password = password
+        self.login_name = login if login is not None else os.getenv("DEVICE_LOGIN", "admin")
+        self.password = password if password is not None else os.getenv("DEVICE_PASSWORD", "")
         self.timeout = timeout
 
     def _client(self) -> httpx.Client:
@@ -110,12 +116,29 @@ class IntelbrasClient:
             raise DeviceError(f"Não foi possível contatar o equipamento: {exc}") from exc
 
     def list_users(self) -> list[dict[str, Any]]:
-        with self._client() as client:
-            response = client.get(self._url("/api/user/get"))
-            response.raise_for_status()
-            data = self._check(response.json(), "user/get")
-        items = ((data.get("data") or {}).get("item")) or []
-        return list(items)
+        """Lista todos os usuários. Se o facial paginar a resposta, busca as outras páginas."""
+        try:
+            with self._client() as client:
+                response = client.get(self._url("/api/user/get"))
+                response.raise_for_status()
+                data = self._check(response.json(), "user/get")
+                payload = data.get("data") or {}
+                items = list(payload.get("item") or [])
+                total = _int_or_none(payload.get("num") or payload.get("total"))
+                page = 1
+                while total is not None and len(items) < total and page < USER_PAGE_LIMIT:
+                    page += 1
+                    response = client.get(self._url("/api/user/get"), params={"page": page})
+                    response.raise_for_status()
+                    more = (self._check(response.json(), "user/get").get("data") or {}).get("item")
+                    known = {str(item.get("ID")) for item in items}
+                    fresh = [item for item in (more or []) if str(item.get("ID")) not in known]
+                    if not fresh:
+                        break
+                    items.extend(fresh)
+        except (httpx.HTTPError, ValueError) as exc:
+            raise DeviceError(f"Não foi possível listar os usuários do facial: {exc}") from exc
+        return items
 
     def find_user_by_registration(self, registration: str) -> Optional[dict[str, Any]]:
         for user in self.list_users():
@@ -123,20 +146,72 @@ class IntelbrasClient:
                 return user
         return None
 
+    def _export_archive(self) -> bytes:
+        with self._client() as client:
+            response = client.get(self._url("/api/user/export"))
+            response.raise_for_status()
+            return response.content
+
+    def _face_signature(self, registration: str) -> FaceSignature:
+        """Modelo do rosto que o facial gerou para a matrícula.
+
+        O facial só reconhece quem tem a pasta faceIDs/<FaceID>-<nome>/ no
+        export. Ter FaceID ou a foto em RegFaceMeun não basta: a foto fica lá
+        sem modelo quando o facial não achou o rosto, e o leitor responde
+        "usuário desconhecido".
+        """
+        try:
+            raw = self._export_archive()
+            with tarfile.open(fileobj=BytesIO(raw), mode="r:gz") as archive:
+                xml_member = archive.extractfile("faceIDs/userdata.xml")
+                if xml_member is None:
+                    return None
+                root = ET.fromstring(xml_member.read())
+                face_id = next(
+                    (
+                        str(key.get("FaceID") or "")
+                        for key in root.findall("Key")
+                        if str(key.get("UserID")) == str(registration)
+                    ),
+                    "",
+                )
+                if face_id in ("", "0"):
+                    return ()
+                # O mtime no export é a hora do export e as partes têm tamanho fixo:
+                # só o conteúdo diz se o modelo mudou.
+                prefix = f"faceIDs/{face_id}-"
+                digest = hashlib.sha256()
+                found = False
+                for item in sorted(archive.getmembers(), key=lambda entry: entry.name):
+                    if not (item.isfile() and item.size > 0 and item.name.startswith(prefix)):
+                        continue
+                    fileobj = archive.extractfile(item)
+                    if fileobj is None:
+                        continue
+                    digest.update(fileobj.read())
+                    found = True
+        except (httpx.HTTPError, tarfile.TarError, ET.ParseError, OSError, EOFError) as exc:
+            logger.warning("Não foi possível ler o export do facial %s: %s", self.base_url, exc)
+            return None
+        return (face_id, digest.hexdigest()) if found else ()
+
     def _face_confirmed(
         self,
         registration: str,
         *,
+        previous: FaceSignature = (),
         retries: int = FACE_CONFIRM_RETRIES,
     ) -> bool:
+        """Confirma que o facial gerou um modelo novo do rosto para a matrícula."""
         for attempt in range(retries):
             user = self.find_user_by_registration(registration)
-            if user:
-                status = user.get("FaceStatus")
-                if status in (1, "1", True):
-                    return True
-                face_id = user.get("FaceID")
-                if face_id not in (None, "", "0", 0):
+            if user and _face_assigned(user):
+                signature = self._face_signature(registration)
+                if signature is None:
+                    # Sem export não dá para ver o modelo: só vale o FaceStatus do facial.
+                    if user.get("FaceStatus") in (1, "1", True):
+                        return True
+                elif signature and signature != previous:
                     return True
             if attempt + 1 < retries:
                 time.sleep(FACE_CONFIRM_DELAY)
@@ -151,7 +226,6 @@ class IntelbrasClient:
         device_user_id: int,
         face_public_url: Optional[str],
     ) -> list[tuple[str, Callable[[], None]]]:
-        short_name = name.strip()[:60]
         attempts: list[tuple[str, Callable[[], None]]] = []
         if face_public_url and face_public_url.startswith("http://"):
             attempts.append(
@@ -165,17 +239,9 @@ class IntelbrasClient:
                     ),
                 )
             )
+        # O import do UserData.tgz grava a foto sem gerar o modelo do rosto, então não entra aqui.
         attempts.extend(
             [
-                (
-                    "import",
-                    lambda: self._attach_face_via_import(
-                        registration=registration,
-                        name=short_name,
-                        jpeg_path=jpeg_path,
-                        device_user_id=device_user_id,
-                    ),
-                ),
                 (
                     "register_img",
                     lambda: self._send_face_via_register_img(
@@ -314,7 +380,8 @@ class IntelbrasClient:
         device_user_id: int,
         face_public_url: Optional[str] = None,
     ) -> bool:
-        """Tenta vários métodos, em rodadas, até o XPE confirmar FaceStatus."""
+        """Tenta vários métodos, em rodadas, até o XPE gerar o modelo do rosto."""
+        previous = self._face_signature(registration) or ()
         attempts = self._face_attempts(
             registration=registration,
             name=name,
@@ -335,7 +402,7 @@ class IntelbrasClient:
                         exc,
                     )
                     continue
-                if self._face_confirmed(registration):
+                if self._face_confirmed(registration, previous=previous):
                     logger.info(
                         "Face confirmada via %s na rodada %s (reg=%s)",
                         label,
@@ -344,7 +411,7 @@ class IntelbrasClient:
                     )
                     return True
                 logger.warning(
-                    "%s aceito na rodada %s, mas FaceStatus não confirmou (reg=%s)",
+                    "%s aceito na rodada %s, mas o facial não gerou o modelo do rosto (reg=%s)",
                     label,
                     round_num + 1,
                     registration,
@@ -463,99 +530,6 @@ class IntelbrasClient:
                     last_error = exc
         raise DeviceError(f"Upload multipart da face rejeitado: {last_error}")
 
-    def _attach_face_via_import(
-        self,
-        *,
-        registration: str,
-        name: str,
-        jpeg_path: Path,
-        device_user_id: int,
-    ) -> None:
-        jpeg_bytes = Path(jpeg_path).read_bytes()
-        time.sleep(0.5)
-        with self._client() as client:
-            exported = client.get(self._url("/api/user/export"))
-            exported.raise_for_status()
-            raw = exported.content
-
-        with tarfile.open(fileobj=BytesIO(raw), mode="r:gz") as src:
-            xml_member = src.extractfile("faceIDs/userdata.xml")
-            if xml_member is None:
-                raise DeviceError("Export do XPE sem userdata.xml")
-            xml_bytes = xml_member.read()
-
-        root = ET.fromstring(xml_bytes)
-        keys = list(root.findall("Key"))
-        max_face = 0
-        target = None
-        for key in keys:
-            try:
-                max_face = max(max_face, int(key.get("FaceID") or 0))
-            except ValueError:
-                pass
-            if str(key.get("UserID")) == str(registration):
-                target = key
-
-        new_face = max_face + 1
-        if target is None:
-            target = ET.SubElement(
-                root,
-                "Key",
-                {
-                    "ID": str(device_user_id),
-                    "FaceID": str(new_face),
-                    "UserID": registration,
-                    "Name": name,
-                    "Card": "",
-                    "Pin": "",
-                    "Floor": "9999",
-                    "Mon": "0",
-                    "Tue": "0",
-                    "Wed": "0",
-                    "Thur": "0",
-                    "Fri": "0",
-                    "Sat": "0",
-                    "Sun": "0",
-                    "TimeStart": "",
-                    "TimeEnd": "",
-                },
-            )
-        else:
-            target.set("FaceID", str(new_face))
-            target.set("Name", name)
-            target.set("Floor", target.get("Floor") or "9999")
-        _mark_face_always(target)
-
-        new_xml = ET.tostring(root, encoding="utf-8", xml_declaration=True)
-        out = BytesIO()
-        with tarfile.open(fileobj=BytesIO(raw), mode="r:gz") as src, tarfile.open(
-            fileobj=out, mode="w:gz"
-        ) as dst:
-            for member in src.getmembers():
-                if member.name == "faceIDs/userdata.xml":
-                    info = tarfile.TarInfo(name=member.name)
-                    info.size = len(new_xml)
-                    info.mtime = int(time.time())
-                    dst.addfile(info, BytesIO(new_xml))
-                else:
-                    fileobj = src.extractfile(member)
-                    dst.addfile(member, fileobj)
-            face_name = f"faceIDs/RegFaceMeun/{new_face}.jpg"
-            info = tarfile.TarInfo(name=face_name)
-            info.size = len(jpeg_bytes)
-            info.mtime = int(time.time())
-            dst.addfile(info, BytesIO(jpeg_bytes))
-
-        package = out.getvalue()
-        with self._client() as client:
-            response = client.post(
-                self._url("/api/user/import"),
-                files={"file": ("UserData.tgz", package, "application/gzip")},
-                data={"target": "user", "action": "import"},
-            )
-            response.raise_for_status()
-            self._check(response.json(), "user/import")
-
     def _grant_always_access(
         self,
         *,
@@ -620,46 +594,92 @@ class IntelbrasClient:
         except httpx.HTTPError as exc:
             raise DeviceError(f"Falha ao atualizar usuário: {exc}") from exc
 
-    def delete_user(
+    def _find_user(
         self,
         *,
-        registration: Optional[str] = None,
-        device_user_id: Optional[int] = None,
-    ) -> None:
-        item: dict[str, Any] = {}
-        if registration:
-            item["UserID"] = registration
-        elif device_user_id is not None:
-            item["ID"] = str(device_user_id)
-        else:
-            raise DeviceError("Informe registration ou device_user_id para excluir.")
+        registration: Optional[str],
+        device_user_id: Optional[int],
+    ) -> Optional[dict[str, Any]]:
+        for user in self.list_users():
+            if registration:
+                if str(user.get("UserID")) == str(registration):
+                    return user
+            elif str(user.get("ID")) == str(device_user_id):
+                return user
+        return None
 
+    def _post_delete(self, item: dict[str, Any]) -> None:
         payload = {"target": "user", "action": "del", "data": {"item": [item]}}
         try:
             with self._client() as client:
                 response = client.post(self._url("/api/user/del"), json=payload)
                 response.raise_for_status()
                 data = response.json()
-                if isinstance(data, dict) and str(data.get("message", "")).lower() in {
-                    "user not exist",
-                    "not exist",
-                }:
-                    return
-                self._check(data, "user/del")
-        except httpx.HTTPError as exc:
+        except (httpx.HTTPError, ValueError) as exc:
             raise DeviceError(f"Falha ao remover usuário: {exc}") from exc
+        if isinstance(data, dict) and str(data.get("message", "")).lower() in {
+            "user not exist",
+            "not exist",
+        }:
+            return
+        self._check(data, "user/del")
+
+    def delete_user(
+        self,
+        *,
+        registration: Optional[str] = None,
+        device_user_id: Optional[int] = None,
+    ) -> None:
+        """Apaga o usuário e confere na lista do facial que ele sumiu.
+
+        O facial pode responder OK sem apagar, então só retorna quando a
+        matrícula não aparece mais na lista. O ID interno muda de um facial
+        para o outro: com matrícula, ele é sempre lido deste aparelho.
+        """
+        if not registration and device_user_id is None:
+            raise DeviceError("Informe registration ou device_user_id para excluir.")
+        user = self._find_user(registration=registration, device_user_id=device_user_id)
+        if user is None:
+            if registration:
+                # Garante a exclusão mesmo se a lista vier incompleta.
+                try:
+                    self._post_delete({"UserID": registration})
+                except DeviceError as exc:
+                    logger.debug("Exclusão de %s fora da lista: %s", registration, exc)
+            return
+
+        internal_id = str(user.get("ID") or "")
+        user_id = str(user.get("UserID") or registration or "")
+        payloads = [
+            item
+            for item in (
+                {"ID": internal_id} if internal_id else None,
+                {"UserID": user_id} if user_id else None,
+                {"ID": internal_id, "UserID": user_id} if internal_id and user_id else None,
+            )
+            if item
+        ]
+        last_error: Optional[Exception] = None
+        for item in payloads:
+            try:
+                self._post_delete(item)
+            except DeviceError as exc:
+                last_error = exc
+                continue
+            for attempt in range(DELETE_CONFIRM_RETRIES):
+                if self._find_user(registration=registration, device_user_id=device_user_id) is None:
+                    logger.info("Usuário %s apagado do facial %s", user_id or internal_id, self.base_url)
+                    return
+                if attempt + 1 < DELETE_CONFIRM_RETRIES:
+                    time.sleep(DELETE_CONFIRM_DELAY)
+        detail = f": {last_error}" if last_error else ""
+        raise DeviceError(
+            f"O facial {self.base_url} não apagou o usuário {user_id or internal_id}{detail}"
+        )
 
     def block_user(self, device_user_id: int, registration: Optional[str] = None) -> None:
         if registration:
             self.delete_user(registration=registration)
-            return
-        user = None
-        for item in self.list_users():
-            if int(item.get("ID", -1)) == int(device_user_id):
-                user = item
-                break
-        if user and user.get("UserID"):
-            self.delete_user(registration=str(user["UserID"]))
         else:
             self.delete_user(device_user_id=device_user_id)
 
@@ -777,7 +797,9 @@ class IntelbrasClient:
         if existing:
             device_id = int(existing["ID"])
             face_ok = True
-            if image_path:
+            # Quem já tem o modelo do rosto no facial não precisa reenviar a foto.
+            has_model = bool((image_path or face_public_url) and self._face_signature(registration))
+            if image_path and not has_model:
                 face_ok = self._send_face(
                     registration=registration,
                     name=name,
@@ -785,14 +807,15 @@ class IntelbrasClient:
                     device_user_id=device_id,
                     face_public_url=face_public_url,
                 )
-            elif face_public_url:
+            elif face_public_url and not has_model:
                 self.update_user(
                     device_user_id=device_id,
                     registration=registration,
                     name=name,
                     face_public_url=face_public_url,
                 )
-                face_ok = self._face_confirmed(registration)
+                if not self._face_confirmed(registration):
+                    raise DeviceError(FACE_NOT_ACCEPTED_MSG)
             try:
                 self._grant_always_access(
                     device_user_id=device_id,
@@ -812,7 +835,8 @@ class IntelbrasClient:
 
         if not image_path or not Path(image_path).exists():
             raise DeviceError(
-                "Exame renovado, mas a foto salva não foi encontrada para recriar o acesso facial."
+                "A foto salva não foi encontrada para recriar o acesso facial. "
+                "Envie uma foto nova pelo botão Foto."
             )
         if previous_device_user_id is not None:
             try:
@@ -1057,42 +1081,107 @@ def public_media_url(filename: str) -> str:
     return f"http://{ip}:{PORT}/media/{filename}"
 
 
+_photo_lock = threading.Lock()
+
+
+def _int_or_none(value: object) -> Optional[int]:
+    try:
+        return int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+
+
+def _face_assigned(user: dict[str, Any]) -> bool:
+    if user.get("FaceStatus") in (1, "1", True):
+        return True
+    return user.get("FaceID") not in (None, "", "0", 0)
+
+
+def _jpeg_ready(path: Path) -> bool:
+    """JPEG inteiro, RGB, sem rotação pendente e no tamanho que o facial aceita."""
+    try:
+        size = path.stat().st_size
+        if size < FACE_MIN_BYTES or size > FACE_MAX_BYTES:
+            return False
+        with Image.open(path) as img:
+            if img.format != "JPEG" or img.mode != "RGB":
+                return False
+            if img.getexif().get(0x0112, 1) != 1:
+                return False
+            w, h = img.size
+            if min(w, h) < FACE_MIN_SIDE or max(w, h) > FACE_MAX_SIDE:
+                return False
+            img.load()
+    except Exception:  # noqa: BLE001 — arquivo que não abre inteiro precisa ser refeito
+        return False
+    return True
+
+
 def _ensure_jpeg_file(image_path: Path) -> Path:
+    """Devolve um JPEG pronto para o facial, sem regravar o que já está pronto.
+
+    Um facial baixa a foto pela FaceUrl enquanto o outro recebe a mesma foto.
+    Regravar o arquivo no meio do download entregava um JPEG cortado, então a
+    foto pronta não é tocada e a nova vai para um temporário trocado de uma vez.
+    """
     path = Path(image_path)
     if not path.exists():
         raise DeviceError(f"Arquivo de foto não encontrado: {path}")
 
     dest = path if path.suffix.lower() in {".jpg", ".jpeg"} else path.with_suffix(".jpg")
-    try:
-        with Image.open(path) as img:
-            if img.mode != "RGB":
-                img = img.convert("RGB")
-            w, h = img.size
-            if min(w, h) < 250:
-                scale = 250 / float(min(w, h))
-                img = img.resize(
-                    (max(250, int(w * scale)), max(250, int(h * scale))),
-                    Image.Resampling.LANCZOS,
-                )
-            max_side = 800
-            w, h = img.size
-            if max(w, h) > max_side:
-                ratio = max_side / float(max(w, h))
-                img = img.resize((int(w * ratio), int(h * ratio)), Image.Resampling.LANCZOS)
-            img.save(dest, format="JPEG", quality=92)
-    except DeviceError:
-        raise
-    except Exception as exc:
-        raise DeviceError(f"Não foi possível processar a imagem: {exc}") from exc
-
-    if dest.stat().st_size > 2 * 1024 * 1024:
-        raise DeviceError("Foto maior que 2MB após compressão. Use outra imagem.")
+    with _photo_lock:
+        if _jpeg_ready(dest) and (dest == path or dest.stat().st_mtime >= path.stat().st_mtime):
+            return dest
+        tmp = dest.with_name(f".{dest.stem}_{uuid.uuid4().hex[:8]}.tmp")
+        try:
+            with Image.open(path) as source:
+                img = ImageOps.exif_transpose(source)
+                if img.mode != "RGB":
+                    img = img.convert("RGB")
+                w, h = img.size
+                if min(w, h) < FACE_MIN_SIDE:
+                    scale = FACE_MIN_SIDE / float(min(w, h))
+                    img = img.resize(
+                        (max(FACE_MIN_SIDE, int(w * scale)), max(FACE_MIN_SIDE, int(h * scale))),
+                        Image.Resampling.LANCZOS,
+                    )
+                w, h = img.size
+                if max(w, h) > FACE_MAX_SIDE:
+                    ratio = FACE_MAX_SIDE / float(max(w, h))
+                    img = img.resize(
+                        (max(1, int(w * ratio)), max(1, int(h * ratio))),
+                        Image.Resampling.LANCZOS,
+                    )
+                img.save(tmp, format="JPEG", quality=92)
+            if not _jpeg_ready(tmp):
+                raise DeviceError("A foto ficou inválida depois de convertida. Tire outra foto.")
+            os.replace(tmp, dest)
+        except DeviceError:
+            raise
+        except Exception as exc:
+            raise DeviceError(f"Não foi possível processar a imagem: {exc}") from exc
+        finally:
+            tmp.unlink(missing_ok=True)
     return dest
+
+
+def face_photo(image_path: Path) -> Path:
+    """JPEG que vai para o facial a partir da foto salva (foto antiga em PNG vira .jpg ao lado)."""
+    return _ensure_jpeg_file(Path(image_path))
+
+
+def prepare_face_photo(image_path: Path) -> Path:
+    """Converte a foto recebida no JPEG que vai para o facial e apaga o original."""
+    path = Path(image_path)
+    jpeg = _ensure_jpeg_file(path)
+    if jpeg != path:
+        path.unlink(missing_ok=True)
+    return jpeg
 
 
 def _prepare_jpeg_base64(image_path: Path) -> str:
     path = _ensure_jpeg_file(image_path)
     data = path.read_bytes()
-    if len(data) < 1000:
+    if len(data) < FACE_MIN_BYTES:
         raise DeviceError("Arquivo de foto inválido ou muito pequeno.")
     return base64.b64encode(data).decode("ascii")

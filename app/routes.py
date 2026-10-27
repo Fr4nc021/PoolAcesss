@@ -21,10 +21,15 @@ from flask import (
 from werkzeug.utils import secure_filename
 
 from app import db, exam_test
+from app import settings as app_settings
 from app.config import (
     PHOTOS_DIR,
+    EXPIRY_HOUR,
+    PORT,
     VALIDITY_DAYS,
+    configured_device_urls,
     ensure_directories,
+    exam_expires_from,
     normalize_pool_ids,
     pool_label,
     registration_pools,
@@ -35,10 +40,12 @@ from app.intelbras_client import (
     DeviceError,
     DeviceFleet,
     IntelbrasClient,
+    face_photo,
     fleet_for_pool,
+    prepare_face_photo,
     public_media_url,
 )
-from app.netcheck import lan_ip_problem
+from app.netcheck import lan_ip_problem, local_ipv4_addresses, suggested_ip
 from app import updater
 from app.sync import build_state, request_sync, run_sync_cycle, status_view
 from app.tray import schedule_close_prompt
@@ -51,7 +58,16 @@ bp = Blueprint("main", __name__)
 
 ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
 APP_TITLE = "Acesso Piscinas Clube Aliança"
-_ADM_TABS = {"socios", "vencimentos", "acessos", "teste"}
+_ADM_TABS = {"socios", "vencimentos", "acessos", "teste", "config"}
+_WEEKDAYS = ("seg", "ter", "qua", "qui", "sex", "sáb", "dom")
+
+
+@bp.app_template_filter("data_hora")
+def data_hora(value: Optional[datetime]) -> str:
+    """Data exata com o dia da semana: sex, 27/11/2026 22:00."""
+    if value is None:
+        return "—"
+    return f"{_WEEKDAYS[value.weekday()]}, {value.strftime('%d/%m/%Y %H:%M')}"
 
 
 def _blocks_update(view):
@@ -135,7 +151,12 @@ def _save_upload(photo, name_hint: str) -> Path:
     filename = f"{safe_stem}_{uuid.uuid4().hex[:8]}{ext}"
     photo_path = PHOTOS_DIR / filename
     photo.save(photo_path)
-    return photo_path
+    # A FaceUrl aponta para este arquivo: ele já precisa ser o JPEG final, não o PNG enviado.
+    try:
+        return prepare_face_photo(photo_path)
+    except DeviceError:
+        photo_path.unlink(missing_ok=True)
+        raise
 
 
 def _parse_device_log_time(value: object) -> Optional[datetime]:
@@ -291,6 +312,7 @@ def cadastrar():
         return render_template(
             "cadastrar.html",
             validity_days=VALIDITY_DAYS,
+        expiry_hour=EXPIRY_HOUR,
             app_title=APP_TITLE,
             pools=registration_pools(),
         )
@@ -340,7 +362,7 @@ def cadastrar():
             photo_path,
             face_public_url=face_url,
         )
-        expires_at = datetime.now() + timedelta(days=VALIDITY_DAYS)
+        expires_at = exam_expires_from(datetime.now())
         member = db.create_member(
             name=name,
             registration=created.registration,
@@ -362,8 +384,8 @@ def cadastrar():
 
     msg = (
         f"{member.name} cadastrado(a) (matrícula {member.registration}). "
-        f"Exame médico válido até "
-        f"{member.medical_exam_expires_at.strftime('%d/%m/%Y %H:%M')}. "
+        f"Exame médico válido até {data_hora(member.medical_exam_expires_at)}; "
+        "nesse horário a face é apagada do Intelbras. "
         f"Foto confirmada no Intelbras ({pool_label(pool)})."
     )
 
@@ -389,7 +411,9 @@ def membros():
     return render_template(
         "membros.html",
         members=members,
+        removed_at=db.last_removal_times(),
         validity_days=VALIDITY_DAYS,
+        expiry_hour=EXPIRY_HOUR,
         app_title=APP_TITLE,
     )
 
@@ -402,9 +426,25 @@ def renovar(member_id: int):
         flash("Membro não encontrado.", "error")
         return redirect(url_for("main.membros"))
 
+    # Bloqueado já saiu do facial: o OK exame recria o usuário com a foto salva neste PC.
     photo_path = Path(member.photo_path) if member.photo_path else None
+    if photo_path is not None and not photo_path.is_file():
+        photo_path = None
+    if photo_path is None and member.access_blocked:
+        flash(
+            f"A foto de {member.name} não está neste PC, então o facial não tem como receber o rosto. "
+            "Use o botão Foto para enviar uma nova. O exame não foi renovado.",
+            "error",
+        )
+        return _redirect_after_member_action(url_for("main.membros"))
     face_url = None
-    if photo_path and photo_path.exists():
+    if photo_path is not None:
+        try:
+            # Foto antiga em PNG: o facial baixa o JPEG convertido, não o arquivo original.
+            photo_path = face_photo(photo_path)
+        except DeviceError as exc:
+            flash(f"A foto salva de {member.name} não abriu: {exc} Use o botão Foto.", "error")
+            return _redirect_after_member_action(url_for("main.membros"))
         face_url = public_media_url(photo_path.name)
 
     client = fleet_for_pool(member.pool)
@@ -416,7 +456,7 @@ def renovar(member_id: int):
             previous_device_user_id=member.device_user_id,
             face_public_url=face_url,
         )
-        new_expires = datetime.now() + timedelta(days=VALIDITY_DAYS)
+        new_expires = exam_expires_from(datetime.now())
         updated = db.renew_member(member_id, expires_at=new_expires)
         if updated and created.device_user_id != member.device_user_id:
             db.update_device_user_id(member_id, created.device_user_id)
@@ -427,10 +467,17 @@ def renovar(member_id: int):
         return _redirect_after_member_action(url_for("main.membros"))
 
     request_sync()
+    from app.expiry import reschedule
+
+    reschedule()
+    photo_note = (
+        "Foto salva reenviada e confirmada no Intelbras."
+        if member.access_blocked
+        else "Foto confirmada no Intelbras."
+    )
     flash(
-        f"Exame médico de {updated.name} renovado até "
-        f"{updated.medical_exam_expires_at.strftime('%d/%m/%Y %H:%M')}. "
-        "Foto confirmada no Intelbras.",
+        f"Exame médico de {updated.name} renovado até {data_hora(updated.medical_exam_expires_at)}; "
+        f"nesse horário a face é apagada do Intelbras. {photo_note}",
         "success",
     )
     return _redirect_after_member_action(url_for("main.membros"))
@@ -457,6 +504,7 @@ def adm_testar_sync():
 def adm():
     # Sync sob demanda via botão — evita travar a página se o XPE estiver offline
     sync_note = request.args.get("sync_note")
+    is_local = request.remote_addr in {"127.0.0.1", "::1"}
 
     now = datetime.now()
     week_ago = now - timedelta(days=7)
@@ -472,6 +520,7 @@ def adm():
         "adm.html",
         app_title=APP_TITLE,
         validity_days=VALIDITY_DAYS,
+        expiry_hour=EXPIRY_HOUR,
         sync_note=sync_note,
         stats={
             "total_members": total_members,
@@ -492,11 +541,30 @@ def adm():
         blocked_events=db.list_access_events(limit=40, result="blocked"),
         change_events=db.list_access_events(
             limit=40,
-            results=["registered", "renewed", "photo_updated", "pool_updated", "deleted"],
+            results=["registered", "renewed", "photo_updated", "pool_updated", "expiry_changed", "deleted"],
         ),
         test_members=_test_members(),
         now_input=now.strftime("%Y-%m-%dT%H:%M"),
+        removed_at=db.last_removal_times(),
+        settings=app_settings.current() if is_local else None,
+        net=_network_info() if is_local else None,
     )
+
+
+def _network_info() -> dict:
+    """IP deste PC e endereço para colocar no outro PC, para a aba Configurações."""
+    import socket
+
+    ips = sorted(local_ipv4_addresses())
+    configured = (app_settings.current().get("SERVER_LAN_IP") or "").strip()
+    return {
+        "hostname": socket.gethostname(),
+        "ips": ips,
+        "suggested": suggested_ip(frozenset(ips)) if ips else "",
+        "problem": lan_ip_problem(),
+        "self_url": f"http://{configured}:{PORT}" if configured else "",
+        "port": PORT,
+    }
 
 
 def _test_members() -> list[dict]:
@@ -689,6 +757,151 @@ def adm_piscinas(member_id: int):
     return _redirect_adm("socios")
 
 
+@bp.post("/adm/membros/<int:member_id>/validade")
+@_blocks_update
+def adm_validade(member_id: int):
+    """ADM muda data e hora do vencimento. Vale nos dois PCs, mesmo mais curta."""
+    member = db.get_member(member_id)
+    if member is None:
+        flash("Membro não encontrado.", "error")
+        return _redirect_adm("socios")
+    tab = (request.form.get("return_tab") or "socios").strip()
+    if exam_test.is_held(member.registration):
+        flash(f"{member.name} está na aba Teste. Encerre o teste antes de mudar a validade.", "error")
+        return _redirect_adm(tab)
+    try:
+        expires_at = datetime.strptime(request.form.get("expires_at") or "", "%Y-%m-%dT%H:%M")
+    except ValueError:
+        flash("Informe a data e a hora do vencimento.", "error")
+        return _redirect_adm(tab)
+    old = member.medical_exam_expires_at
+    if expires_at == old:
+        flash(f"A validade de {member.name} já é {data_hora(old)}.", "success")
+        return _redirect_adm(tab)
+
+    reopen = member.access_blocked and expires_at > datetime.now()
+    if reopen:
+        try:
+            _reopen_on_device(member)
+        except DeviceError as exc:
+            logger.exception("Falha ao devolver a face ao mudar a validade")
+            flash(
+                f"Validade não alterada: não foi possível devolver {member.name} ao facial ({exc}).",
+                "error",
+            )
+            return _redirect_adm(tab)
+    updated = db.set_exam_expiry(member.id, expires_at, unblock=reopen, manual=True) or member
+    db.log_access_event(
+        result="expiry_changed",
+        member_name=member.name,
+        registration=member.registration,
+        detail=f"{old.strftime('%d/%m/%Y %H:%M')} → {expires_at.strftime('%d/%m/%Y %H:%M')} (ADM)",
+    )
+    when = data_hora(expires_at)
+    category = "success"
+    if updated.is_expired and not updated.access_blocked:
+        from app.expiry import block_member_on_devices
+
+        if block_member_on_devices(updated, fleet_for_pool(updated.pool)):
+            message = f"Validade de {member.name} alterada para {when}. Já venceu: a face foi apagada do Intelbras."
+        else:
+            category = "error"
+            message = (
+                f"Validade de {member.name} alterada para {when}, mas o facial não apagou o sócio. "
+                "A checagem tenta de novo a cada 15 minutos."
+            )
+    elif updated.access_blocked:
+        message = f"Validade de {member.name} alterada para {when}. O sócio continua bloqueado."
+    elif reopen:
+        message = (
+            f"Validade de {member.name} alterada para {when}. A face voltou para o Intelbras "
+            "e será apagada nesse horário."
+        )
+    else:
+        message = f"Validade de {member.name} alterada para {when}. A face será apagada do Intelbras nesse horário."
+    from app.expiry import reschedule
+
+    reschedule()
+    request_sync()
+    flash(message, category)
+    return _redirect_adm(tab)
+
+
+def _local_only():
+    if _local_admin_request():
+        return None
+    return jsonify({"ok": False, "error": "Abra as Configurações no PC onde o programa está aberto."}), 403
+
+
+@bp.post("/adm/config")
+def adm_config_salvar():
+    """Grava as configurações da aba Configurações no env.txt/.env deste PC."""
+    forbidden = _local_only()
+    if forbidden:
+        return forbidden
+    data = request.get_json(silent=True) or {}
+    form = {key: str(data.get(key) or "") for key in app_settings.FIELDS}
+    try:
+        changed = app_settings.save(form)
+    except app_settings.SettingsError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    except OSError as exc:
+        logger.exception("Falha ao gravar as configurações")
+        return jsonify({"ok": False, "error": f"Não foi possível gravar o arquivo: {exc}"}), 500
+    if changed:
+        logger.info("Configurações alteradas: %s", ", ".join(changed))
+        request_sync()
+        flash("Configurações salvas: " + ", ".join(changed) + ".", "success")
+    else:
+        flash("Nada mudou nas configurações.", "success")
+    return jsonify({"ok": True, "changed": changed})
+
+
+@bp.post("/adm/config/testar-faciais")
+def adm_config_testar_faciais():
+    """Testa os faciais com o que está na tela (senha em branco usa a salva)."""
+    forbidden = _local_only()
+    if forbidden:
+        return forbidden
+    data = request.get_json(silent=True) or {}
+    login = str(data.get("login") or "").strip() or None
+    password = str(data.get("password") or "") or None
+    urls = [str(item) for item in (data.get("urls") or []) if str(item).strip()]
+    rows = []
+    for raw in (urls or configured_device_urls())[:4]:
+        try:
+            url = app_settings._http_url(raw, "Facial")
+        except app_settings.SettingsError as exc:
+            rows.append({"url": raw, "ok": False, "error": str(exc)})
+            continue
+        row = DeviceFleet([IntelbrasClient(base_url=url, login=login, password=password, timeout=8)]).status()[0]
+        if not row.get("ok") and "401" in str(row.get("error")):
+            row["error"] = "Usuário ou senha dos faciais errados."
+        rows.append(row)
+    return jsonify({"ok": True, "devices": rows})
+
+
+@bp.post("/adm/config/testar-ip")
+def adm_config_testar_ip():
+    """Confere se o programa responde no IP que o facial usa para baixar as fotos."""
+    forbidden = _local_only()
+    if forbidden:
+        return forbidden
+    import httpx
+
+    problem = lan_ip_problem()
+    url = public_media_url("x").rsplit("/media/", 1)[0]
+    if not url:
+        return jsonify({"ok": False, "error": problem or "IP deste PC não configurado."})
+    try:
+        response = httpx.get(f"{url}/saude", params={"rapido": "1"}, timeout=5)
+        reachable = response.status_code == 200
+    except httpx.HTTPError as exc:
+        reachable = False
+        problem = problem or f"O programa não respondeu em {url}: {exc}"
+    return jsonify({"ok": reachable and not problem, "url": url, "error": problem or None})
+
+
 @bp.post("/adm/sincronizar-logs")
 def adm_sincronizar_logs():
     try:
@@ -767,10 +980,12 @@ def _test_forbidden():
 
 
 def _reopen_on_device(member: db.Member) -> None:
-    """Devolve a face ao facial de quem foi bloqueado durante o teste."""
+    """Devolve a face ao facial de quem foi bloqueado (teste ou validade nova no ADM)."""
     photo = Path(member.photo_path) if member.photo_path else None
     if photo is not None and not photo.is_file():
         photo = None
+    if photo is not None:
+        photo = face_photo(photo)
     face_url = public_media_url(photo.name) if photo is not None else None
     created = fleet_for_pool(member.pool).renew_member(
         name=member.name,
@@ -820,11 +1035,29 @@ def adm_teste_data():
         member.registration,
         expires_at.isoformat(timespec="minutes"),
     )
-    flash(
-        f"Teste: exame de {updated.name} vale até "
-        f"{updated.medical_exam_expires_at.strftime('%d/%m/%Y %H:%M')}.",
-        "success",
-    )
+    from app.expiry import reschedule
+
+    reschedule()
+    when = updated.medical_exam_expires_at.strftime("%d/%m/%Y %H:%M")
+    if updated.is_expired and not updated.access_blocked:
+        # Data vencida bloqueia na hora, sem esperar a checagem de 15 minutos.
+        from app.expiry import block_member_on_devices
+
+        if not block_member_on_devices(updated, fleet_for_pool(updated.pool)):
+            flash(
+                f"Teste: exame de {updated.name} venceu em {when}, mas o facial não apagou o "
+                "sócio. Veja se os faciais estão ligados e use “Rodar checagem agora”.",
+                "error",
+            )
+            return jsonify({"ok": True, "blocked": False})
+        request_sync()
+        flash(
+            f"Teste: exame de {updated.name} venceu em {when}. Sócio apagado do facial: "
+            "o leitor já deve negar o acesso.",
+            "success",
+        )
+        return jsonify({"ok": True, "blocked": True})
+    flash(f"Teste: exame de {updated.name} vale até {when}.", "success")
     return jsonify({"ok": True})
 
 

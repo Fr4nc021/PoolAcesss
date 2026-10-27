@@ -31,6 +31,7 @@ _labels: dict[str, Optional[str]] = {
     "cloud_alert": None,
 }
 _bucket_ready = False
+_cloud_without_set_at = False
 
 PHOTO_BUCKET = "fotos"
 # Fotos sem sócio na nuvem são apagadas uma vez por dia. A folga de 1 hora
@@ -52,13 +53,37 @@ class MemberSnapshot:
     created_at: datetime
     updated_at: datetime
     pool: Optional[str] = None
+    expiry_set_at: Optional[datetime] = None
+
+
+def _merged_expiry(local: MemberSnapshot, remote: MemberSnapshot) -> tuple[datetime, Optional[datetime]]:
+    """Data do exame e de quando uma pessoa a definiu.
+
+    A data que uma pessoa definiu por último vence, mesmo mais curta (o ADM
+    pode encurtar a validade). Um lado sem expiry_set_at (cadastro antigo ou
+    versão anterior) só perde se não mudou depois disso. Fora isso, a mais
+    longa vence.
+    """
+    for mine, other in ((local, remote), (remote, local)):
+        stamp = mine.expiry_set_at
+        if stamp is None:
+            continue
+        if other.expiry_set_at is not None:
+            if stamp > other.expiry_set_at:
+                return mine.medical_exam_expires_at, stamp
+        elif stamp >= other.updated_at:
+            return mine.medical_exam_expires_at, stamp
+    stamps = [item for item in (local.expiry_set_at, remote.expiry_set_at) if item]
+    expires = max(local.medical_exam_expires_at, remote.medical_exam_expires_at)
+    return expires, max(stamps) if stamps else None
 
 
 def merge_snapshots(
     local: Optional[MemberSnapshot],
     remote: MemberSnapshot,
 ) -> tuple[MemberSnapshot, bool]:
-    """Junta dois cadastros. A data de exame mais longa vence.
+    """Junta dois cadastros. A data de exame mais longa vence, salvo a definida
+    depois por uma pessoa (veja _merged_expiry).
 
     Nome, bloqueio e foto seguem o updated_at mais recente. Uma renovação
     (exame mais longo e desbloqueado) desfaz um bloqueio feito com a data antiga.
@@ -67,7 +92,7 @@ def merge_snapshots(
     if local is None:
         return remote, False
 
-    expires = max(local.medical_exam_expires_at, remote.medical_exam_expires_at)
+    expires, expiry_set_at = _merged_expiry(local, remote)
     if remote.updated_at >= local.updated_at:
         winner, other = remote, local
     else:
@@ -102,6 +127,7 @@ def merge_snapshots(
         created_at=min(local.created_at, remote.created_at),
         updated_at=max(local.updated_at, remote.updated_at),
         pool=pool,
+        expiry_set_at=expiry_set_at,
     )
     needs_unblock = bool(
         local.access_blocked
@@ -183,6 +209,7 @@ def member_payload(member: db.Member) -> dict:
         "created_at": _iso(member.created_at),
         "updated_at": _iso(member.updated_at),
         "pool": member.pool,
+        "expiry_set_at": _iso(member.expiry_set_at) if member.expiry_set_at else None,
     }
 
 
@@ -555,7 +582,7 @@ def _push_cloud(
                         _upload_photo(client, base_url, key, digest, data)
             to_upsert.append(payload)
         for chunk in _chunks(to_upsert, 100):
-            _upsert(client, f"{base_url}/rest/v1/members?on_conflict=registration", headers, chunk)
+            _upsert_members(client, f"{base_url}/rest/v1/members?on_conflict=registration", headers, chunk)
 
         events: list[dict] = []
         for event in db.list_events_for_sync():
@@ -604,6 +631,7 @@ def _apply_remote_member(
                 created_at=merged.created_at,
                 updated_at=merged.updated_at,
                 pool=merged.pool,
+                expiry_set_at=merged.expiry_set_at,
             )
     db.upsert_synced_member(
         name=merged.name,
@@ -617,6 +645,7 @@ def _apply_remote_member(
         updated_at=merged.updated_at,
         mark_unblock_pending=needs_unblock,
         pool=merged.pool,
+        expiry_set_at=merged.expiry_set_at,
     )
 
 
@@ -833,6 +862,7 @@ def _snapshot_from_member(member: db.Member) -> MemberSnapshot:
         created_at=member.created_at,
         updated_at=member.updated_at,
         pool=member.pool,
+        expiry_set_at=member.expiry_set_at,
     )
 
 
@@ -845,6 +875,7 @@ def _snapshot_from_payload(item: dict) -> Optional[MemberSnapshot]:
         expires = _parse_iso(item.get("medical_exam_expires_at"))
         created = _parse_iso(item.get("created_at")) or expires
         updated = _parse_iso(item.get("updated_at")) or created
+        expiry_set_at = _parse_iso(item.get("expiry_set_at"))
     except ValueError:
         logger.warning("Cadastro remoto com data inválida: %s", registration)
         return None
@@ -873,6 +904,7 @@ def _snapshot_from_payload(item: dict) -> Optional[MemberSnapshot]:
         created_at=created,
         updated_at=updated,
         pool=_optional_text(item.get("pool")),
+        expiry_set_at=expiry_set_at,
     )
 
 
@@ -885,6 +917,7 @@ def _member_differs(payload: dict, remote: MemberSnapshot) -> bool:
         "access_blocked": remote.access_blocked,
         "updated_at": _iso(remote.updated_at),
         "pool": remote.pool,
+        "expiry_set_at": _iso(remote.expiry_set_at) if remote.expiry_set_at else None,
     }
     local_compare = {
         "name": payload.get("name"),
@@ -894,6 +927,7 @@ def _member_differs(payload: dict, remote: MemberSnapshot) -> bool:
         "access_blocked": bool(payload.get("access_blocked")),
         "updated_at": payload.get("updated_at"),
         "pool": payload.get("pool"),
+        "expiry_set_at": payload.get("expiry_set_at"),
     }
     return local_compare != remote_payload
 
@@ -944,6 +978,24 @@ def _upsert(client: httpx.Client, url: str, headers: dict[str, str], rows: list[
     prefer["Prefer"] = "resolution=merge-duplicates,return=minimal"
     response = client.post(url, headers=prefer, json=rows)
     response.raise_for_status()
+
+
+def _upsert_members(client: httpx.Client, url: str, headers: dict[str, str], rows: list[dict]) -> None:
+    """Nuvem criada antes da coluna expiry_set_at: envia sem ela até rodar o SQL novo."""
+    global _cloud_without_set_at
+    if _cloud_without_set_at:
+        rows = [{k: v for k, v in row.items() if k != "expiry_set_at"} for row in rows]
+    try:
+        _upsert(client, url, headers, rows)
+    except httpx.HTTPStatusError as exc:
+        if _cloud_without_set_at or "expiry_set_at" not in exc.response.text:
+            raise
+        logger.warning(
+            "A nuvem não tem a coluna expiry_set_at. Rode scripts/supabase_schema.sql de novo "
+            "para a validade alterada no ADM valer pela nuvem."
+        )
+        _cloud_without_set_at = True
+        _upsert_members(client, url, headers, rows)
 
 
 def _upload_photo(client: httpx.Client, base_url: str, key: str, digest: str, data: bytes) -> None:

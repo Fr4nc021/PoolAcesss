@@ -1,4 +1,5 @@
 {% extends "base.html" %}
+{% from "_macros.html" import removal %}
 {% block title %}ADM — Acesso Piscinas Clube Aliança{% endblock %}
 
 {% block content %}
@@ -12,19 +13,10 @@
       </p>
     </div>
     <div class="panel-actions">
-      <button type="button" class="btn btn-secondary" id="btn-test-sync">Testar sincronização</button>
-      {% if is_local_request %}
-      <button type="button" class="btn btn-secondary" id="btn-test-validity">Testar validade no facial</button>
-      {% endif %}
       <form method="post" action="{{ url_for('main.adm_sincronizar_logs') }}">
         <button type="submit" class="btn btn-secondary">Sincronizar logs do XPE</button>
       </form>
     </div>
-  </div>
-  <div id="sync-test" class="sync-test" hidden aria-live="polite"></div>
-  <div id="validity-test" class="sync-test" hidden aria-live="polite">
-    <p>Resultado do teste de validade. Copie todo o texto abaixo e envie para análise.</p>
-    <textarea id="validity-result" rows="12" readonly></textarea>
   </div>
 
   {% if sync_note %}
@@ -74,6 +66,10 @@
     <button type="button" class="adm-tab" role="tab" id="tab-teste" aria-selected="false" aria-controls="panel-teste" data-tab="teste">
       Teste{% if test_members %} <span class="tab-count">{{ test_members|length }}</span>{% endif %}
     </button>
+    <button type="button" class="adm-tab adm-tab-config" role="tab" id="tab-config" aria-selected="false" aria-controls="panel-config" data-tab="config" title="Configurações">
+      <svg class="gear" viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path fill="currentColor" d="M19.14 12.94a7.07 7.07 0 0 0 .05-.94 7.07 7.07 0 0 0-.05-.94l2.03-1.58a.49.49 0 0 0 .12-.61l-1.92-3.32a.49.49 0 0 0-.59-.22l-2.39.96a7.03 7.03 0 0 0-1.62-.94l-.36-2.54a.48.48 0 0 0-.48-.41h-3.84a.48.48 0 0 0-.48.41l-.36 2.54c-.59.24-1.13.56-1.62.94l-2.39-.96a.49.49 0 0 0-.59.22L2.74 8.87a.48.48 0 0 0 .12.61l2.03 1.58a7.4 7.4 0 0 0 0 1.88l-2.03 1.58a.49.49 0 0 0-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.48-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32a.49.49 0 0 0-.12-.61l-2.03-1.58ZM12 15.6A3.6 3.6 0 1 1 12 8.4a3.6 3.6 0 0 1 0 7.2Z"/></svg>
+      Configurações
+    </button>
     {% endif %}
   </div>
 
@@ -107,6 +103,7 @@
             <th>Matrícula</th>
             <th>Piscina</th>
             <th>Válido até</th>
+            <th>Sai do Intelbras</th>
             <th>Status</th>
             <th>Ações</th>
           </tr>
@@ -123,7 +120,8 @@
             <td>{{ m.name }}</td>
             <td class="mono">{{ m.registration }}</td>
             <td>{{ m.pool_label }}</td>
-            <td>{{ m.medical_exam_expires_at.strftime('%d/%m/%Y %H:%M') }}</td>
+            <td class="when">{{ m.medical_exam_expires_at|data_hora }}</td>
+            <td>{{ removal(m, removed_at) }}</td>
             <td><span class="badge {{ m.status_class }}">{{ m.status_label }}</span></td>
             <td class="actions">
               <div class="row-actions">
@@ -140,6 +138,14 @@
                   <button type="submit" class="btn btn-secondary btn-sm">Bloquear</button>
                 </form>
                 {% endif %}
+                <form>
+                  <button type="button" class="btn btn-secondary btn-sm" data-expiry-edit
+                          data-action="{{ url_for('main.adm_validade', member_id=m.id) }}"
+                          data-name="{{ m.name }}"
+                          data-blocked="{{ '1' if m.access_blocked else '0' }}"
+                          data-expires="{{ m.medical_exam_expires_at.strftime('%Y-%m-%dT%H:%M') }}"
+                          data-return-tab="socios">Validade</button>
+                </form>
                 <form>
                   <button type="button" class="btn btn-secondary btn-sm" data-pool-edit
                           data-action="{{ url_for('main.adm_piscinas', member_id=m.id) }}"
@@ -183,6 +189,7 @@
         </div>
       </form>
     </dialog>
+
     {% else %}
     <p class="empty">Nenhum sócio cadastrado ainda.</p>
     {% endif %}
@@ -200,6 +207,7 @@
           <tr>
             <th>Nome</th>
             <th>Venceu em</th>
+            <th>Sai do Intelbras</th>
             <th>Status</th>
             <th></th>
           </tr>
@@ -208,15 +216,26 @@
           {% for m in expired_members %}
           <tr>
             <td>{{ m.name }}</td>
-            <td>{{ m.medical_exam_expires_at.strftime('%d/%m/%Y %H:%M') }}</td>
+            <td class="when">{{ m.medical_exam_expires_at|data_hora }}</td>
+            <td>{{ removal(m, removed_at) }}</td>
             <td><span class="badge {{ m.status_class }}">{{ m.status_label }}</span></td>
             <td class="actions">
-              <form method="post" action="{{ url_for('main.renovar', member_id=m.id) }}"
-                    data-confirm="Renovar exame de {{ m.name }}?"
-                    onsubmit="return confirm(this.dataset.confirm);">
-                <input type="hidden" name="return_tab" value="vencimentos">
-                <button type="submit" class="btn btn-secondary btn-sm">OK exame</button>
-              </form>
+              <div class="row-actions">
+                <form method="post" action="{{ url_for('main.renovar', member_id=m.id) }}"
+                      data-confirm="Renovar exame de {{ m.name }}? A foto salva é reenviada ao Intelbras."
+                      onsubmit="return confirm(this.dataset.confirm);">
+                  <input type="hidden" name="return_tab" value="vencimentos">
+                  <button type="submit" class="btn btn-secondary btn-sm">OK exame</button>
+                </form>
+                <form>
+                  <button type="button" class="btn btn-secondary btn-sm" data-expiry-edit
+                          data-action="{{ url_for('main.adm_validade', member_id=m.id) }}"
+                          data-name="{{ m.name }}"
+                          data-blocked="{{ '1' if m.access_blocked else '0' }}"
+                          data-expires="{{ m.medical_exam_expires_at.strftime('%Y-%m-%dT%H:%M') }}"
+                          data-return-tab="vencimentos">Validade</button>
+                </form>
+              </div>
             </td>
           </tr>
           {% endfor %}
@@ -235,15 +254,28 @@
           <tr>
             <th>Nome</th>
             <th>Válido até</th>
+            <th>Sai do Intelbras</th>
             <th>Status</th>
+            <th></th>
           </tr>
         </thead>
         <tbody>
           {% for m in expiring_members %}
           <tr>
             <td>{{ m.name }}</td>
-            <td>{{ m.medical_exam_expires_at.strftime('%d/%m/%Y %H:%M') }}</td>
+            <td class="when">{{ m.medical_exam_expires_at|data_hora }}</td>
+            <td>{{ removal(m, removed_at) }}</td>
             <td><span class="badge {{ m.status_class }}">{{ m.status_label }}</span></td>
+            <td class="actions">
+              <form>
+                <button type="button" class="btn btn-secondary btn-sm" data-expiry-edit
+                        data-action="{{ url_for('main.adm_validade', member_id=m.id) }}"
+                        data-name="{{ m.name }}"
+                        data-blocked="0"
+                        data-expires="{{ m.medical_exam_expires_at.strftime('%Y-%m-%dT%H:%M') }}"
+                        data-return-tab="vencimentos">Validade</button>
+              </form>
+            </td>
           </tr>
           {% endfor %}
         </tbody>
@@ -388,8 +420,9 @@
   <div class="adm-panel" id="panel-teste" role="tabpanel" aria-labelledby="tab-teste" data-panel="teste" hidden>
     <h2>Teste de vencimento</h2>
     <p class="lead">
-      Mude a data do exame de um sócio para ver o bloqueio no facial. A checagem automática roda a cada
-      15 minutos; use “Rodar checagem agora” para não esperar. Quem está em teste fica só neste PC
+      Mude a data do exame de um sócio para ver o bloqueio no facial. Uma data já vencida apaga o sócio
+      do facial na hora; uma data futura bloqueia quando vencer (cadastros e renovações vencem às
+      {{ expiry_hour }}h, e a checagem também roda a cada 15 minutos). Quem está em teste fica só neste PC
       e não vai para o outro PC nem para a nuvem. Ao encerrar, a data original volta e, se ainda valer,
       a face volta para o facial. Fechar o programa também encerra os testes.
     </p>
@@ -458,11 +491,156 @@
     <p class="empty">Nenhum sócio em teste.</p>
     {% endif %}
   </div>
+
+  <div class="adm-panel" id="panel-config" role="tabpanel" aria-labelledby="tab-config" data-panel="config" hidden>
+    <h2>Configurações</h2>
+    <p class="lead">
+      Faciais, IP deste PC, outro PC e nuvem. Ao salvar, o programa grava em
+      <span class="mono">{{ settings.env_file }}</span> e já passa a usar os valores novos, sem reiniciar.
+      Senhas em branco continuam as mesmas.
+    </p>
+
+    <form id="config-form" class="config-form" autocomplete="off">
+      <fieldset class="config-card">
+        <legend>Faciais Intelbras</legend>
+        <div class="config-grid">
+          <label class="field">
+            <span>Piscina normal (final .86)</span>
+            <input type="text" name="DEVICE_URL" value="{{ settings.DEVICE_URL }}" placeholder="http://192.168.0.86" required>
+          </label>
+          <label class="field">
+            <span>Piscina térmica (final .44)</span>
+            <input type="text" name="DEVICE_URL_2" value="{{ settings.DEVICE_URL_2 }}" placeholder="http://192.168.0.44">
+          </label>
+          <label class="field">
+            <span>Usuário</span>
+            <input type="text" name="DEVICE_LOGIN" value="{{ settings.DEVICE_LOGIN }}" required>
+          </label>
+          <label class="field">
+            <span>Senha</span>
+            <input type="password" name="DEVICE_PASSWORD" placeholder="{{ 'definida — em branco mantém' if settings.DEVICE_PASSWORD else 'não definida' }}" autocomplete="new-password">
+          </label>
+        </div>
+        <div class="config-actions">
+          <button type="button" class="btn btn-secondary" id="btn-test-devices">Testar faciais</button>
+          <button type="button" class="btn btn-secondary" id="btn-test-validity">Testar validade no facial</button>
+        </div>
+        <div id="devices-test" class="sync-test" hidden aria-live="polite"></div>
+        <div id="validity-test" class="sync-test" hidden aria-live="polite">
+          <p>Resultado do teste de validade. Copie todo o texto abaixo e envie para análise.</p>
+          <textarea id="validity-result" rows="12" readonly></textarea>
+        </div>
+      </fieldset>
+
+      <fieldset class="config-card">
+        <legend>Este PC</legend>
+        <dl class="config-info">
+          <dt>Nome do PC</dt><dd class="mono">{{ net.hostname }}</dd>
+          <dt>IPs encontrados</dt>
+          <dd class="mono">{{ net.ips|join(', ') if net.ips else 'nenhum IP de rede local encontrado' }}</dd>
+          <dt>Endereço para o outro PC</dt>
+          <dd class="mono">{{ net.self_url or '—' }}</dd>
+        </dl>
+        <div class="config-grid">
+          <label class="field">
+            <span>IP deste PC (o facial baixa as fotos daqui)</span>
+            <input type="text" name="SERVER_LAN_IP" value="{{ settings.SERVER_LAN_IP }}" placeholder="192.168.0.20" required>
+          </label>
+        </div>
+        {% if net.problem %}<p class="hint is-bad">{{ net.problem }}</p>{% endif %}
+        <div class="config-actions">
+          {% if net.suggested and net.suggested != settings.SERVER_LAN_IP %}
+          <button type="button" class="btn btn-secondary" id="btn-use-ip" data-ip="{{ net.suggested }}">Usar {{ net.suggested }}</button>
+          {% endif %}
+          <button type="button" class="btn btn-secondary" id="btn-test-ip">Testar IP</button>
+        </div>
+        <div id="ip-test" class="sync-test" hidden aria-live="polite"></div>
+      </fieldset>
+
+      <fieldset class="config-card">
+        <legend>Outro PC</legend>
+        <p class="hint">
+          Os dois PCs trocam cadastros pela rede. Em cada um, coloque o endereço do outro e a mesma senha de sincronização.
+          Sem endereço, o programa funciona só neste PC.
+        </p>
+        <div class="config-grid">
+          <label class="field">
+            <span>Endereço do outro PC</span>
+            <input type="text" name="SYNC_PEER_URL" value="{{ settings.SYNC_PEER_URL }}" placeholder="http://192.168.0.21:{{ settings.port }}">
+          </label>
+          <label class="field">
+            <span>Senha de sincronização (igual nos dois)</span>
+            <span class="input-row">
+              <input type="text" name="SYNC_TOKEN" placeholder="{{ 'definida — em branco mantém' if settings.SYNC_TOKEN else 'não definida' }}">
+              <button type="button" class="btn btn-secondary btn-sm" id="btn-gen-token">Gerar</button>
+            </span>
+          </label>
+          <label class="field">
+            <span>Intervalo da troca (segundos)</span>
+            <input type="number" name="SYNC_INTERVAL_SECONDS" value="{{ settings.SYNC_INTERVAL_SECONDS }}" min="5" max="3600">
+          </label>
+        </div>
+      </fieldset>
+
+      <fieldset class="config-card">
+        <legend>Nuvem (Supabase)</legend>
+        <p class="hint">Backup e troca pela internet. Sem endereço, a nuvem fica desligada.</p>
+        <div class="config-grid">
+          <label class="field">
+            <span>Endereço do projeto</span>
+            <input type="text" name="SUPABASE_URL" value="{{ settings.SUPABASE_URL }}" placeholder="https://xxxx.supabase.co">
+          </label>
+          <label class="field">
+            <span>Chave service_role</span>
+            <input type="password" name="SUPABASE_KEY" placeholder="{{ 'definida — em branco mantém' if settings.SUPABASE_KEY else 'não definida' }}" autocomplete="new-password">
+          </label>
+        </div>
+        <div class="config-actions">
+          <button type="button" class="btn btn-secondary" id="btn-test-sync">Testar outro PC e nuvem</button>
+        </div>
+        <p class="hint">O teste usa o que está salvo. Salve antes de testar um valor novo.</p>
+        <div id="sync-test" class="sync-test" hidden aria-live="polite"></div>
+      </fieldset>
+
+      <div class="config-save">
+        <p class="hint test-error is-bad" id="config-error" hidden></p>
+        <button type="submit" class="btn btn-primary">Salvar configurações</button>
+      </div>
+    </form>
+  </div>
   {% endif %}
+
+  <dialog id="expiry-dialog" class="pool-dialog">
+    <form method="post" id="expiry-form" class="expiry-form">
+      <input type="hidden" name="return_tab" value="socios">
+      <h3>Validade de <span id="expiry-name"></span></h3>
+      <p class="hint">
+        Data e hora em que o exame vence. Nesse horário a face é apagada do Intelbras.
+        Vale também no outro PC, mesmo sendo antes da data atual.
+      </p>
+      <label class="field">
+        <span>Vence em</span>
+        <input type="datetime-local" name="expires_at" required>
+      </label>
+      <p class="hint" id="expiry-preview" aria-live="polite"></p>
+      <div class="test-presets" role="group" aria-label="Atalhos de validade">
+        <button type="button" class="filter-btn" data-expiry-preset="today">Hoje às {{ expiry_hour }}h</button>
+        <button type="button" class="filter-btn" data-expiry-preset="days" data-days="7">Daqui a 7 dias</button>
+        <button type="button" class="filter-btn" data-expiry-preset="days" data-days="{{ validity_days }}">Daqui a {{ validity_days }} dias</button>
+      </div>
+      <p class="hint" id="expiry-blocked-note" hidden>
+        Este sócio está bloqueado. Uma data futura libera o acesso e reenvia a foto salva ao Intelbras.
+      </p>
+      <div class="pool-dialog-actions">
+        <button type="button" class="btn btn-secondary" id="expiry-cancel">Cancelar</button>
+        <button type="submit" class="btn btn-primary">Salvar validade</button>
+      </div>
+    </form>
+  </dialog>
 </section>
 
 <script>
-  const tabNames = ["socios", "vencimentos", "acessos", "teste"];
+  const tabNames = ["socios", "vencimentos", "acessos", "teste", "config"];
   const tabButtons = Array.from(document.querySelectorAll(".adm-tab"));
   const panels = Array.from(document.querySelectorAll("[data-panel]"));
 
@@ -546,6 +724,62 @@
     });
   });
   document.getElementById("pool-cancel")?.addEventListener("click", () => poolDialog.close());
+
+  const expiryDialog = document.getElementById("expiry-dialog");
+  const expiryForm = document.getElementById("expiry-form");
+  const expiryPreview = document.getElementById("expiry-preview");
+  const weekdays = ["dom", "seg", "ter", "qua", "qui", "sex", "sáb"];
+  const expiryHour = {{ expiry_hour }};
+  let expiryBlocked = false;
+
+  function paintExpiryPreview() {
+    const value = expiryForm.elements.expires_at.value;
+    if (!value) {
+      expiryPreview.textContent = "";
+      return;
+    }
+    const when = new Date(value);
+    const label = `${weekdays[when.getDay()]}, ${when.toLocaleDateString("pt-BR")} ${value.slice(11, 16)}`;
+    if (when > new Date()) {
+      expiryPreview.textContent = `Vence e sai do Intelbras em ${label}.`;
+    } else if (expiryBlocked) {
+      expiryPreview.textContent = `${label}: já passou. O sócio continua bloqueado.`;
+    } else {
+      expiryPreview.textContent = `${label}: já passou. Ao salvar, a face é apagada do Intelbras na hora.`;
+    }
+  }
+
+  document.querySelectorAll("[data-expiry-edit]").forEach((button) => {
+    button.addEventListener("click", () => {
+      expiryForm.action = button.dataset.action;
+      expiryForm.elements.return_tab.value = button.dataset.returnTab || "socios";
+      expiryForm.elements.expires_at.value = button.dataset.expires;
+      document.getElementById("expiry-name").textContent = button.dataset.name;
+      expiryBlocked = button.dataset.blocked === "1";
+      document.getElementById("expiry-blocked-note").hidden = !expiryBlocked;
+      paintExpiryPreview();
+      expiryDialog.showModal();
+    });
+  });
+  expiryForm?.elements.expires_at.addEventListener("input", paintExpiryPreview);
+  expiryForm?.querySelectorAll("[data-expiry-preset]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const when = new Date();
+      when.setDate(when.getDate() + Number(button.dataset.days || 0));
+      when.setHours(expiryHour, 0, 0, 0);
+      expiryForm.elements.expires_at.value = toLocalInput(when);
+      paintExpiryPreview();
+    });
+  });
+  document.getElementById("expiry-cancel")?.addEventListener("click", () => expiryDialog.close());
+  expiryForm?.addEventListener("submit", (event) => {
+    const when = new Date(expiryForm.elements.expires_at.value);
+    if (when <= new Date() && !expiryBlocked && !window.confirm(
+      `${document.getElementById("expiry-name").textContent}: essa data já passou. A face será apagada do Intelbras agora. Continuar?`
+    )) {
+      event.preventDefault();
+    }
+  });
   poolForm?.addEventListener("submit", (event) => {
     if (!poolForm.querySelector('input[name="pool"]:checked')) {
       event.preventDefault();
@@ -667,6 +901,108 @@
     });
   });
 
+  const localHeaders = { Accept: "application/json", "Content-Type": "application/json", "X-Acesso-Local": "1" };
+  const configForm = document.getElementById("config-form");
+
+  async function postLocal(url, body) {
+    const response = await fetch(url, { method: "POST", headers: localHeaders, body: JSON.stringify(body || {}) });
+    let data = {};
+    try {
+      data = await response.json();
+    } catch (_) {
+      data = { ok: false, error: "Resposta inválida do programa." };
+    }
+    if (!response.ok && data.ok !== false) data.ok = false;
+    return data;
+  }
+
+  function resultBox(id, lines) {
+    const box = document.getElementById(id);
+    box.hidden = false;
+    box.replaceChildren(...lines.map(([css, text]) => {
+      const line = document.createElement("p");
+      line.className = css;
+      line.textContent = text;
+      return line;
+    }));
+  }
+
+  async function runButton(button, busyText, task) {
+    const label = button.textContent;
+    button.disabled = true;
+    button.textContent = busyText;
+    try {
+      await task();
+    } finally {
+      button.disabled = false;
+      button.textContent = label;
+    }
+  }
+
+  if (configForm) {
+    const field = (name) => configForm.elements[name];
+
+    document.getElementById("btn-test-devices")?.addEventListener("click", (event) => {
+      runButton(event.currentTarget, "Testando…", async () => {
+        resultBox("devices-test", [["is-wait", "Testando os faciais…"]]);
+        const data = await postLocal("/adm/config/testar-faciais", {
+          urls: [field("DEVICE_URL").value, field("DEVICE_URL_2").value],
+          login: field("DEVICE_LOGIN").value,
+          password: field("DEVICE_PASSWORD").value,
+        });
+        if (!data.ok) {
+          resultBox("devices-test", [["is-bad", data.error || "Não foi possível testar."]]);
+          return;
+        }
+        resultBox("devices-test", data.devices.map((item) => item.ok
+          ? ["is-ok", `${item.url}: conectado (${item.model})`]
+          : ["is-bad", `${item.url}: ${item.error}`]));
+      });
+    });
+
+    document.getElementById("btn-test-ip")?.addEventListener("click", (event) => {
+      runButton(event.currentTarget, "Testando…", async () => {
+        const data = await postLocal("/adm/config/testar-ip");
+        resultBox("ip-test", data.ok
+          ? [["is-ok", `O programa responde em ${data.url}. O facial consegue buscar as fotos aqui.`]]
+          : [["is-bad", data.error || "O IP deste PC não respondeu."]]);
+      });
+    });
+
+    document.getElementById("btn-use-ip")?.addEventListener("click", (event) => {
+      field("SERVER_LAN_IP").value = event.currentTarget.dataset.ip;
+      field("SERVER_LAN_IP").focus();
+    });
+
+    document.getElementById("btn-gen-token")?.addEventListener("click", () => {
+      const bytes = new Uint8Array(18);
+      crypto.getRandomValues(bytes);
+      field("SYNC_TOKEN").value = Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
+      window.alert("Senha gerada. Salve aqui e coloque a mesma senha nas Configurações do outro PC.");
+    });
+
+    configForm.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const error = document.getElementById("config-error");
+      error.hidden = true;
+      const body = {};
+      Array.from(configForm.elements).forEach((input) => {
+        if (input.name) body[input.name] = input.value;
+      });
+      const button = configForm.querySelector('button[type="submit"]');
+      await runButton(button, "Salvando…", async () => {
+        const data = await postLocal("/adm/config", body);
+        if (!data.ok) {
+          error.textContent = data.error || "Não foi possível salvar.";
+          error.hidden = false;
+          return;
+        }
+        location.hash = "#config";
+        location.reload();
+      });
+    });
+  }
+
   function syncLine(title, item) {
     const line = document.createElement("p");
     line.className = (item && item.css) || "";
@@ -728,7 +1064,7 @@
         syncTest.append(error);
       } finally {
         syncTestButton.disabled = false;
-        syncTestButton.textContent = "Testar sincronização";
+        syncTestButton.textContent = "Testar outro PC e nuvem";
       }
     });
   }

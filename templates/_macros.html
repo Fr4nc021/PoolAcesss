@@ -1,0 +1,11 @@
+{# Quando a face sai do Intelbras. removed_at: matrícula -> hora do último bloqueio. #}
+{% macro removal(m, removed_at) -%}
+{% if m.access_blocked %}
+  {% set when = removed_at.get(m.registration) %}
+  <span class="removal is-done">Apagado{% if when %} em {{ when|data_hora }}{% endif %}</span>
+{% elif m.is_expired %}
+  <span class="removal is-late" title="O facial não respondeu na hora do vencimento. A checagem tenta de novo a cada 15 minutos.">Pendente: facial não respondeu</span>
+{% else %}
+  <span class="removal">{{ m.medical_exam_expires_at|data_hora }}</span>
+{% endif %}
+{%- endmacro %}
