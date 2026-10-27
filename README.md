@@ -34,7 +34,7 @@ Quando o exame vence, o sistema remove o usuário do equipamento automaticamente
 copy .env.example .env
 ```
 
-2. Edite o `.env` com os dados do **seu** ambiente:
+2. Edite o `.env` com os dados do **seu** ambiente. Depois da primeira abertura, faciais, IP deste PC, outro PC e nuvem também podem ser trocados em **ADM > Configurações** (engrenagem), no próprio PC, sem abrir o arquivo e sem reiniciar:
 
 | Variável | Descrição |
 |----------|-----------|

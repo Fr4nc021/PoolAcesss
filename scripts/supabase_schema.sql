@@ -18,6 +18,8 @@ create table if not exists public.members (
 );
 
 alter table public.members add column if not exists pool text;
+-- Quando uma pessoa definiu a validade (OK exame ou ADM). A mais recente vence.
+alter table public.members add column if not exists expiry_set_at text;
 
 create table if not exists public.access_events (
     sync_id text primary key,

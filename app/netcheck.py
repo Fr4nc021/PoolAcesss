@@ -54,6 +54,11 @@ def local_ipv4_addresses() -> frozenset[str]:
     return usable
 
 
+def suggested_ip(ips: frozenset[str]) -> str:
+    """IP deste PC que a aba Configurações sugere para SERVER_LAN_IP."""
+    return _suggest(ips) if ips else ""
+
+
 def _suggest(ips: frozenset[str]) -> str:
     """O IP deste PC na mesma rede dos faciais (ex.: 192.168.15.x)."""
     for url in configured_device_urls():
@@ -71,8 +76,8 @@ def lan_ip_problem(local_ips: frozenset[str] | None = None) -> str:
     configured = os.getenv("SERVER_LAN_IP", "").strip()
     if not configured:
         return (
-            "SERVER_LAN_IP está vazio no env.txt. O facial não consegue baixar as fotos "
-            "deste PC. Rode ipconfig, copie o Endereço IPv4 para o env.txt e reabra o programa."
+            "O IP deste PC (SERVER_LAN_IP) está vazio. O facial não consegue baixar as fotos "
+            "deste PC. Preencha em ADM > Configurações (engrenagem) > Este PC."
         )
     if on_chromeos():
         # No Chromebook o IP do Wi-Fi fica fora do Linux, então não dá para comparar.
@@ -80,13 +85,16 @@ def lan_ip_problem(local_ips: frozenset[str] | None = None) -> str:
     try:
         ipaddress.ip_address(configured)
     except ValueError:
-        return f"SERVER_LAN_IP={configured} não é um endereço IP. Use o Endereço IPv4 do ipconfig."
+        return (
+            f"SERVER_LAN_IP={configured} não é um endereço IP. "
+            "Corrija em ADM > Configurações (engrenagem) > Este PC."
+        )
     ips = local_ipv4_addresses() if local_ips is None else local_ips
     if not ips or configured in ips:
         return ""
     return (
-        f"SERVER_LAN_IP={configured} no env.txt não é deste PC "
+        f"SERVER_LAN_IP={configured} não é deste PC "
         f"(este PC usa {', '.join(sorted(ips))}). "
         "O facial iria buscar a foto em outro computador e o cadastro ficaria sem foto. "
-        f"Troque para SERVER_LAN_IP={_suggest(ips)} no env.txt e reabra o programa."
+        f"Troque para {_suggest(ips)} em ADM > Configurações (engrenagem) > Este PC."
     )

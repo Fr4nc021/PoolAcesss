@@ -291,7 +291,7 @@ def test_http_estado_requires_token() -> None:
             assert adm.status_code == 200
             adm_html = adm.get_data(as_text=True)
             assert 'id="cloud-alert" class="flash flash-error" role="alert" hidden' in adm_html
-            assert "Testar sincronização" in adm_html
+            assert "Testar outro PC e nuvem" in adm_html, "teste fica na aba Configurações"
             assert 'id="btn-test-sync"' in adm_html
             tested = client.post("/adm/testar-sync")
             assert tested.status_code == 200

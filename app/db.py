@@ -88,6 +88,8 @@ def init_db() -> None:
         _ensure_column(conn, "members", "photo_sha256", "TEXT")
         _ensure_column(conn, "members", "device_pending", "TEXT")
         _ensure_column(conn, "members", "pool", "TEXT")
+        # Quando uma pessoa definiu a data do exame (OK exame ou ADM). A mais recente vence na sincronização.
+        _ensure_column(conn, "members", "expiry_set_at", "TEXT")
         _ensure_column(conn, "access_events", "sync_id", "TEXT")
         conn.execute(
             """
@@ -133,7 +135,8 @@ def _align_expiry_hour(conn: sqlite3.Connection) -> None:
 
     Só empurra para mais tarde, então a sincronização (que fica com a data
     mais longa) aceita a mudança nos dois PCs e na nuvem. Bloqueados ficam
-    como estão para não parecerem válidos de novo.
+    como estão para não parecerem válidos de novo, e a data definida por uma
+    pessoa (expiry_set_at) também.
     """
     cutoff = f"{EXPIRY_HOUR:02d}:00:00"
     conn.execute(
@@ -141,6 +144,7 @@ def _align_expiry_hour(conn: sqlite3.Connection) -> None:
         UPDATE members
         SET medical_exam_expires_at = substr(medical_exam_expires_at, 1, 10) || 'T' || ?
         WHERE access_blocked = 0
+          AND expiry_set_at IS NULL
           AND substr(medical_exam_expires_at, 12, 8) < ?
         """,
         (cutoff, cutoff),
@@ -188,6 +192,7 @@ class Member:
     updated_at: datetime
     device_pending: Optional[str] = None
     pool: Optional[str] = None
+    expiry_set_at: Optional[datetime] = None
 
     @property
     def pool_label(self) -> str:
@@ -252,14 +257,16 @@ class AccessEvent:
             "registered": "Cadastrado",
             "photo_updated": "Foto atualizada",
             "pool_updated": "Piscinas alteradas",
-            "deleted": "Excluído",
+            "expiry_changed": "Validade alterada",
             "deleted": "Excluído",
         }
         return mapping.get(self.result, self.result)
 
     @property
     def result_class(self) -> str:
-        if self.result in {"approved", "renewed", "registered", "photo_updated", "pool_updated"}:
+        if self.result in {
+            "approved", "renewed", "registered", "photo_updated", "pool_updated", "expiry_changed"
+        }:
             return "status-ok"
         if self.result in {"denied", "blocked", "deleted"}:
             return "status-expired"
@@ -285,6 +292,11 @@ def _row_to_member(row: sqlite3.Row) -> Member:
         updated_at=_parse_dt(row["updated_at"]),
         device_pending=row["device_pending"] if "device_pending" in keys else None,
         pool=row["pool"] if "pool" in keys else None,
+        expiry_set_at=(
+            _parse_dt(row["expiry_set_at"])
+            if "expiry_set_at" in keys and row["expiry_set_at"]
+            else None
+        ),
     )
 
 
@@ -468,11 +480,13 @@ def renew_member(member_id: int, expires_at: Optional[datetime] = None) -> Optio
             UPDATE members
             SET medical_exam_expires_at = ?,
                 access_blocked = 0,
-                updated_at = ?
+                updated_at = ?,
+                expiry_set_at = ?
             WHERE id = ?
             """,
             (
                 expires.isoformat(timespec="seconds"),
+                now.isoformat(timespec="seconds"),
                 now.isoformat(timespec="seconds"),
                 member_id,
             ),
@@ -587,22 +601,31 @@ def set_exam_expiry(
     expires_at: datetime,
     *,
     unblock: bool = False,
+    manual: bool = False,
 ) -> Optional[Member]:
-    """Grava a data do exame sem registrar renovação. Usado pela aba Teste."""
+    """Grava a data do exame sem registrar renovação.
+
+    A aba Teste grava sem manual. O ADM grava com manual: a data passa a
+    valer nos outros PCs mesmo sendo mais curta.
+    """
     now = datetime.now()
+    stamp = now.isoformat(timespec="seconds")
     with get_connection() as conn:
         cur = conn.execute(
             """
             UPDATE members
             SET medical_exam_expires_at = ?,
                 access_blocked = CASE WHEN ? THEN 0 ELSE access_blocked END,
-                updated_at = ?
+                updated_at = ?,
+                expiry_set_at = CASE WHEN ? THEN ? ELSE expiry_set_at END
             WHERE id = ?
             """,
             (
                 expires_at.isoformat(timespec="seconds"),
                 1 if unblock else 0,
-                now.isoformat(timespec="seconds"),
+                stamp,
+                1 if manual else 0,
+                stamp,
                 member_id,
             ),
         )
@@ -632,6 +655,32 @@ def mark_blocked(member_id: int) -> None:
         )
 
 
+def next_member_expiry(after: datetime) -> Optional[datetime]:
+    """Próximo vencimento de quem ainda está liberado, para a checagem acordar na hora."""
+    with get_connection() as conn:
+        row = conn.execute(
+            """
+            SELECT MIN(medical_exam_expires_at) AS next_at FROM members
+            WHERE access_blocked = 0 AND medical_exam_expires_at > ?
+            """,
+            (after.isoformat(timespec="seconds"),),
+        ).fetchone()
+    return _parse_dt(row["next_at"]) if row and row["next_at"] else None
+
+
+def last_removal_times() -> dict[str, datetime]:
+    """Matrícula -> último bloqueio registrado, que é quando a face saiu do facial."""
+    with get_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT registration, MAX(event_at) AS removed_at FROM access_events
+            WHERE result = 'blocked' AND registration IS NOT NULL
+            GROUP BY registration
+            """
+        ).fetchall()
+    return {row["registration"]: _parse_dt(row["removed_at"]) for row in rows}
+
+
 def list_expired_unblocked() -> list[Member]:
     now = datetime.now().isoformat(timespec="seconds")
     with get_connection() as conn:
@@ -640,7 +689,6 @@ def list_expired_unblocked() -> list[Member]:
             SELECT * FROM members
             WHERE medical_exam_expires_at < ?
               AND access_blocked = 0
-              AND device_user_id IS NOT NULL
             """,
             (now,),
         ).fetchall()
@@ -724,8 +772,10 @@ def upsert_synced_member(
     updated_at: datetime,
     mark_unblock_pending: bool,
     pool: Optional[str] = None,
+    expiry_set_at: Optional[datetime] = None,
 ) -> Member:
     """Grava a junção pela matrícula sem criar evento nem falar com o facial."""
+    set_at = expiry_set_at.isoformat(timespec="seconds") if expiry_set_at else None
     with get_connection() as conn:
         row = conn.execute(
             "SELECT id, device_pending FROM members WHERE registration = ?",
@@ -751,6 +801,7 @@ def upsert_synced_member(
             updated_at.isoformat(timespec="seconds"),
             pending,
             pool,
+            set_at,
             registration,
         )
         if row is None:
@@ -759,8 +810,8 @@ def upsert_synced_member(
                 INSERT INTO members (
                     name, registration, device_user_id, photo_path, photo_sha256,
                     medical_exam_expires_at, access_blocked, created_at, updated_at,
-                    device_pending, pool
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    device_pending, pool, expiry_set_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     name.strip(),
@@ -774,6 +825,7 @@ def upsert_synced_member(
                     updated_at.isoformat(timespec="seconds"),
                     pending,
                     pool,
+                    set_at,
                 ),
             )
         else:
@@ -789,7 +841,8 @@ def upsert_synced_member(
                     created_at = ?,
                     updated_at = ?,
                     device_pending = ?,
-                    pool = ?
+                    pool = ?,
+                    expiry_set_at = ?
                 WHERE registration = ?
                 """,
                 values,

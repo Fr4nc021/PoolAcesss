@@ -32,7 +32,7 @@ def test_ip_of_other_pc_is_reported_with_the_right_suggestion() -> None:
     message = netcheck.lan_ip_problem(THIS_PC)
     assert "192.168.15.4" in message and "não é deste PC" in message
     # Sugere o IP da mesma rede dos faciais, não o da placa virtual.
-    assert "Troque para SERVER_LAN_IP=192.168.15.8" in message
+    assert "Troque para 192.168.15.8 em ADM > Configurações" in message
 
 
 def test_empty_and_invalid_values() -> None:
