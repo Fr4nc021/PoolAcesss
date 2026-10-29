@@ -551,7 +551,7 @@
         <div class="config-actions">
           <button type="button" class="btn btn-secondary" id="btn-test-faceid">Testar FaceID no facial</button>
           <label class="field faceid-photo">
-            <span>Foto de teste (opcional)</span>
+            <span>Foto de alguém da equipe (opcional; sem foto o teste só lê)</span>
             <input type="file" id="faceid-photo" accept="image/*">
           </label>
         </div>
@@ -879,7 +879,9 @@
   if (faceIdButton) {
     faceIdButton.addEventListener("click", async () => {
       if (!window.confirm(
-        "O teste cria um usuário TESTE FACEID em cada facial, envia uma foto de teste algumas vezes para ver qual FaceID o facial dá, e apaga o usuário no final. Se o facial der o FaceID de um sócio, o rosto desse sócio pode mudar: o resultado lista quem foi afetado, para você clicar em \"Enviar foto do sistema\" nele. Leva uns 2 minutos. Continuar?"
+        document.getElementById("faceid-photo").files[0]
+          ? "Com a foto escolhida, o teste cadastra um usuário TESTE FACEID em cada facial pelo mesmo caminho dos sócios, mostra o ID e o FaceID que ele ganhou e apaga no final. Use a foto de alguém da equipe. Se algum sócio for afetado, o resultado mostra o nome. Continuar?"
+          : "Sem foto, o teste só lê os faciais: mostra o ID e o FaceID de cada usuário e quem está com o ID igual ao FaceID de outro. Não mexe em nada. Continuar?"
       )) return;
       const box = document.getElementById("faceid-test");
       const status = document.getElementById("faceid-status");
@@ -906,12 +908,15 @@
         const hurt = [];
         for (const report of data.relatorios || []) {
           if (Array.isArray(report.afetados)) {
-            report.afetados.forEach((row) => hurt.push(`${row.nome} (${row.matricula}) em ${report.facial}: mudou ${row.mudou}`));
+            report.afetados.forEach((row) => hurt.push(`Afetado: ${row.nome} (${row.matricula}) em ${report.facial}: mudou ${row.mudou}`));
           }
+          ((report.ids || {}).id_igual_ao_faceid_de_outro || []).forEach((row) => hurt.push(
+            `${row.nome} (${row.matricula}) em ${report.facial}: o ID ${row.id} é o FaceID de ${row.e_o_faceid_de}`
+          ));
         }
         status.textContent = hurt.length
-          ? "Teste terminado. Os sócios abaixo foram afetados: use \"Enviar foto do sistema\" neles na conferência. Copie todo o texto e envie para análise."
-          : "Teste terminado, nenhum sócio afetado. Copie todo o texto abaixo e envie para análise.";
+          ? "Teste terminado. Confira os sócios abaixo na conferência de fotos (\"Enviar foto do sistema\" agora recria num ID livre). Copie todo o texto e envie para análise."
+          : "Teste terminado, nada a corrigir. Copie todo o texto abaixo e envie para análise.";
         hurt.forEach((line) => {
           const li = document.createElement("li");
           li.textContent = line;

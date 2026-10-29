@@ -19,7 +19,7 @@ from PIL import Image, ImageOps
 
 from app import db
 from app.config import registration_pools, selected_pools
-from app.intelbras_client import ExportUser, IntelbrasClient
+from app.intelbras_client import ExportUser, IntelbrasClient, is_reserve
 
 logger = logging.getLogger(__name__)
 
@@ -178,7 +178,8 @@ def _audit_device(
         section["rows"].append(row)
     # Sócio de outra piscina que ficou neste facial também é um usuário sobrando aqui.
     for user in users:
-        if user.user_id in known:
+        # Reserva de ID não tem rosto nem sócio: é do sistema, não sobra.
+        if user.user_id in known or is_reserve(user.user_id):
             continue
         others = [
             other.name or other.user_id
