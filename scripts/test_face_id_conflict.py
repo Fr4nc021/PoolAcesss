@@ -58,7 +58,8 @@ class PhotoDevice(FakeDevice):
             for item in src.getmembers():
                 dst.addfile(item, src.extractfile(item))
             for face_id, data in self.photos.items():
-                info = tarfile.TarInfo(f"faceIDs/RegFaceMeun/{face_id}.jpg")
+                # Como o facial real: o arquivo conta a partir de 0.
+                info = tarfile.TarInfo(f"faceIDs/RegFaceMeun/{int(face_id) - 1}.jpg")
                 info.size = len(data)
                 dst.addfile(info, io.BytesIO(data))
         return out.getvalue()
@@ -255,6 +256,32 @@ def test_fix_all_safe(tmp: Path) -> None:
     assert not again, f"depois da correção não sobra nada seguro para corrigir: {again}"
 
 
+def test_conflict_repairs_the_other_member(tmp: Path) -> None:
+    import app.face_fix as face_fix
+
+    device, client = _fix_env(tmp, "reparo")
+    later = datetime.now() + timedelta(days=10)
+    flavio_photo = ic.prepare_face_photo(_photo(tmp / "rep_flavio.jpg", size=(480, 640)))
+    paula_photo = ic.prepare_face_photo(_photo(tmp / "rep_paula.jpg", size=(500, 660)))
+    client.register_member("Flavio", flavio_photo, registration="FL1", image_ready=True)
+    db.create_member(name="Flavio", registration="FL1", device_user_id=None, photo_path=str(flavio_photo), expires_at=later, pool="termica")
+    paula = db.create_member(name="Paula", registration="PA1", device_user_id=None, photo_path=str(paula_photo), expires_at=later, pool="termica")
+    flavio_face = device._by_userid("FL1")["FaceID"]
+
+    # O facial junta a foto da Paula no FaceID do Flavio.
+    device.next_face = int(flavio_face)
+    try:
+        face_fix.recreate_on_device(client, paula, paula_photo)
+    except ic.FaceIDConflict as exc:
+        assert exc.others == ["FL1"], exc.others
+        assert "Flavio foi refeito" in str(exc), str(exc)
+    else:
+        raise AssertionError("FaceID repetido precisa dar erro")
+    assert device._by_userid("PA1") is None, "Paula sai do facial"
+    flavio = device._by_userid("FL1")
+    assert flavio and flavio["FaceID"] != flavio_face and flavio["FaceID"] in device.templates, "Flavio refeito com rosto próprio"
+
+
 def test_use_device_photo(tmp: Path) -> None:
     from app.main import create_app
 
@@ -325,6 +352,7 @@ def main() -> None:
         test_next_face_id_needs_export()
         test_audit_finds_each_problem(root)
         test_fix_all_safe(root)
+        test_conflict_repairs_the_other_member(root)
         test_use_device_photo(root)
         test_photo_difference()
     print("face id conflict ok")

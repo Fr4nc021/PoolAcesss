@@ -880,8 +880,8 @@
     faceIdButton.addEventListener("click", async () => {
       if (!window.confirm(
         document.getElementById("faceid-photo").files[0]
-          ? "Com a foto escolhida, o teste cadastra um usuário TESTE FACEID em cada facial pelo mesmo caminho dos sócios, mostra o ID e o FaceID que ele ganhou e apaga no final. Use a foto de alguém da equipe. Se algum sócio for afetado, o resultado mostra o nome. Continuar?"
-          : "Sem foto, o teste só lê os faciais: mostra o ID e o FaceID de cada usuário e quem está com o ID igual ao FaceID de outro. Não mexe em nada. Continuar?"
+          ? "Com a foto escolhida, o teste cadastra um usuário TESTE FACEID em cada facial pelo mesmo caminho dos sócios, mostra o FaceID que ele ganhou e de quem esse número já era, e apaga no final. Use a foto de alguém da equipe. Se algum sócio for afetado, o resultado mostra o nome. Continuar?"
+          : "Sem foto, o teste só lê os faciais: mostra o ID, o FaceID, o modelo do rosto e a foto guardada de cada usuário. Não mexe em nada. Continuar?"
       )) return;
       const box = document.getElementById("faceid-test");
       const status = document.getElementById("faceid-status");
@@ -910,12 +910,9 @@
           if (Array.isArray(report.afetados)) {
             report.afetados.forEach((row) => hurt.push(`Afetado: ${row.nome} (${row.matricula}) em ${report.facial}: mudou ${row.mudou}`));
           }
-          ((report.ids || {}).id_igual_ao_faceid_de_outro || []).forEach((row) => hurt.push(
-            `${row.nome} (${row.matricula}) em ${report.facial}: o ID ${row.id} é o FaceID de ${row.e_o_faceid_de}`
-          ));
         }
         status.textContent = hurt.length
-          ? "Teste terminado. Confira os sócios abaixo na conferência de fotos (\"Enviar foto do sistema\" agora recria num ID livre). Copie todo o texto e envie para análise."
+          ? "Teste terminado. Confira os sócios abaixo na conferência de fotos (\"Enviar foto do sistema\" neles). Copie todo o texto e envie para análise."
           : "Teste terminado, nada a corrigir. Copie todo o texto abaixo e envie para análise.";
         hurt.forEach((line) => {
           const li = document.createElement("li");

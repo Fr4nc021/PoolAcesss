@@ -63,8 +63,12 @@ class FaceIDConflict(DeviceError):
     """O rosto do sócio ficou no mesmo FaceID de outro usuário do facial.
 
     O facial reconhece pelo FaceID: com dois usuários nele, o rosto de um
-    libera a entrada no nome do outro.
+    libera a entrada no nome do outro. others são as matrículas dos outros.
     """
+
+    def __init__(self, message: str, others: Optional[list[str]] = None) -> None:
+        super().__init__(message)
+        self.others = others or []
 
 
 @dataclass
@@ -75,18 +79,6 @@ class ExportUser:
     has_model: bool
     photo: Optional[bytes]
     device_id: str = ""
-
-
-# Usuário sem rosto que só segura um ID interno: o facial grava o rosto de
-# um usuário novo no número do ID dele, e um ID igual ao FaceID de outro
-# sócio trocava o rosto desse sócio. Não tem rosto, então não libera nada.
-RESERVE_PREFIX = "APRES"
-RESERVE_NAME = "RESERVADO - NAO APAGAR"
-RESERVE_MAX_TRIES = 40
-
-
-def is_reserve(registration: object) -> bool:
-    return str(registration or "").startswith(RESERVE_PREFIX)
 
 
 @dataclass
@@ -187,7 +179,8 @@ class IntelbrasClient:
 
         O export traz todos os usuários de uma vez, sem paginação, então é a
         fonte confiável para saber quais FaceIDs já estão em uso. A foto do
-        FaceID fica em faceIDs/RegFaceMeun/<FaceID>.jpg. None = export indisponível.
+        FaceID fica em faceIDs/RegFaceMeun/<FaceID - 1>.jpg (o arquivo conta a
+        partir de 0, o FaceID a partir de 1). None = export indisponível.
         """
         try:
             raw = self._export_archive()
@@ -207,7 +200,7 @@ class IntelbrasClient:
                     elif with_photos and item.name.startswith("faceIDs/RegFaceMeun/"):
                         fileobj = archive.extractfile(item)
                         if fileobj is not None:
-                            photos[Path(item.name).stem] = fileobj.read()
+                            photos[_photo_face_id(Path(item.name).stem)] = fileobj.read()
         except (httpx.HTTPError, tarfile.TarError, ET.ParseError, OSError, EOFError) as exc:
             logger.warning("Não foi possível ler o export do facial %s: %s", self.base_url, exc)
             return None
@@ -392,30 +385,6 @@ class IntelbrasClient:
         )
         return attempts
 
-    def faces_in_use(self, *, exclude: Optional[str] = None) -> set[int]:
-        """FaceIDs dos usuários deste facial, menos o da matrícula exclude."""
-        exported = self.export_users()
-        if exported is not None:
-            pairs = [(u.user_id, u.face_id) for u in exported]
-        else:
-            pairs = [(str(u.get("UserID") or ""), _clean_face_id(u.get("FaceID"))) for u in self.list_users()]
-        return {
-            int(face_id)
-            for user_id, face_id in pairs
-            if face_id.isdigit() and user_id != str(exclude or "")
-        }
-
-    def id_hits_other_face(self, registration: str, user: Optional[dict[str, Any]] = None) -> bool:
-        """O ID interno do usuário é o FaceID de outro: um rosto novo nele troca o rosto do outro."""
-        user = user if user is not None else self.find_user_by_registration(registration)
-        if not user:
-            return False
-        try:
-            device_id = int(user.get("ID"))
-        except (TypeError, ValueError):
-            return False
-        return device_id in self.faces_in_use(exclude=registration)
-
     def _add_plain_user(self, name: str, registration: str) -> dict[str, Any]:
         """Cria o usuário sem foto (o facial rejeita FaceUrl no add) e devolve como aparece na lista."""
         payload = {
@@ -449,37 +418,6 @@ class IntelbrasClient:
             )
         return user
 
-    def _add_user_on_safe_id(self, name: str, registration: str) -> dict[str, Any]:
-        """Cria o usuário num ID interno que não é FaceID de ninguém.
-
-        O facial grava o rosto novo no número do ID interno e escolhe o ID
-        sozinho (não aceita pedido). Se o ID dado é o FaceID de outro sócio,
-        o usuário sai, uma reserva sem rosto fica com esse ID e o cadastro
-        tenta de novo no próximo. Tudo isso antes de mandar qualquer foto.
-        """
-        taken = self.faces_in_use(exclude=registration)
-        for _attempt in range(RESERVE_MAX_TRIES):
-            user = self._add_plain_user(name, registration)
-            device_id = int(user["ID"])
-            if device_id not in taken:
-                return user
-            logger.warning(
-                "ID %s dado a %s em %s é o FaceID de outro sócio: reservando e tentando de novo",
-                device_id,
-                registration,
-                self.base_url,
-            )
-            self.delete_user(registration=registration)
-            reserve = f"{RESERVE_PREFIX}{device_id}"[:12]
-            held = self._add_plain_user(RESERVE_NAME, reserve)
-            if int(held["ID"]) not in taken:
-                # O facial não reaproveitou o número: a reserva não segura nada.
-                self.delete_user(registration=reserve)
-        raise DeviceError(
-            f"O facial {self.base_url} só deu IDs que já são rosto de outro sócio. "
-            "Nada foi enviado. Rode ADM > Configurações > Testar FaceID no facial e envie o resultado."
-        )
-
     def create_user_with_face(
         self,
         name: str,
@@ -492,7 +430,7 @@ class IntelbrasClient:
         reg = (registration or f"AP{int(time.time()) % 100000000:08d}")[:12]
         jpeg_path = image_path if image_ready else _ensure_jpeg_file(image_path)
 
-        user = self._add_user_on_safe_id(name, reg)
+        user = self._add_plain_user(name, reg)
         device_id = int(user["ID"])
         try:
             face_ok = self._send_face(
@@ -594,11 +532,18 @@ class IntelbrasClient:
             ", ".join(others),
             self.base_url,
         )
+        exported = self.export_users() or []
+        face_id = next((u.face_id for u in exported if u.user_id == str(registration)), "")
+        registrations = [
+            u.user_id for u in exported if face_id and u.face_id == face_id and u.user_id != str(registration)
+        ]
+        # O facial junta no mesmo FaceID um rosto que ele acha que já conhece:
+        # quase sempre a foto salva é da outra pessoa ou parecida demais com ela.
         raise FaceIDConflict(
-            f"O facial {self.base_url} gravou o rosto de {name} no mesmo número "
-            f"de rosto (FaceID) de {', '.join(others)}. Nesse estado o rosto de um "
-            "libera a entrada no nome do outro. Use o botão Foto em cada um para "
-            "refazer, ou confira em ADM > Conferir fotos no Intelbras."
+            f"O facial {self.base_url} achou que a foto de {name} é o rosto de "
+            f"{', '.join(others)} e juntou os dois no mesmo FaceID. Confira se a foto "
+            f"salva de {name} é mesmo dela/dele; se não for, tire uma foto nova pelo botão Foto.",
+            registrations,
         )
 
     def _send_face_via_data_uri(
@@ -638,7 +583,8 @@ class IntelbrasClient:
         return max_face + 1
 
     def _put_register_img(self, face_id: int, jpeg_bytes: bytes) -> str:
-        path = f"/Image/RegisterImg/{face_id}.jpg"
+        # O arquivo conta a partir de 0: o FaceID 12 é RegisterImg/11.jpg.
+        path = f"/Image/RegisterImg/{face_id - 1}.jpg"
         last_error: Optional[Exception] = None
         with self._client() as client:
             for verb in (client.put, client.post):
@@ -909,14 +855,13 @@ class IntelbrasClient:
         return []
 
     def _drop_shared_face(self, registration: str, name: str) -> None:
-        """Apaga do facial o usuário que está num número de rosto de outro, para recriar do zero.
+        """Apaga do facial o usuário que divide o FaceID com outro, para recriar do zero.
 
-        Vale para FaceID repetido e para ID interno igual ao FaceID de outro
-        sócio: reenviar a foto no mesmo usuário troca o rosto do outro junto.
-        Recriado num ID livre (_add_user_on_safe_id), o rosto fica só dele.
+        Reenviar a foto no mesmo usuário mantém o FaceID repetido e troca o
+        rosto do outro sócio junto. Recriado, o usuário recebe um FaceID novo.
         """
         logger.warning(
-            "%s (reg=%s) está num número de rosto de outro usuário em %s: recriando",
+            "%s (reg=%s) divide o FaceID com outro usuário em %s: recriando",
             name,
             registration,
             self.base_url,
@@ -935,10 +880,7 @@ class IntelbrasClient:
         """Atualiza a foto facial de um membro já cadastrado (ou recria se sumiu)."""
         jpeg_path = _ensure_jpeg_file(image_path)
         existing = self.find_user_by_registration(registration)
-        # A foto nova vai para o número do ID: se ele é rosto de outro, recria num ID livre.
-        if existing and (
-            self.face_shared_with(registration) or self.id_hits_other_face(registration, existing)
-        ):
+        if existing and self.face_shared_with(registration):
             existing = self._drop_shared_face(registration, name)
         if existing:
             device_id = int(existing["ID"])
@@ -1003,17 +945,13 @@ class IntelbrasClient:
     ) -> CreatedUser:
         self.ping()
         existing = self.find_user_by_registration(registration)
-        if existing:
-            shared = self.face_shared_with(registration)
-            # Só reenvia a foto quem não tem o modelo; nesse caso o ID não pode ser rosto de outro.
-            resend = not self._face_signature(registration)
-            if shared or (resend and self.id_hits_other_face(registration, existing)):
-                if not image_path or not Path(image_path).exists():
-                    raise DeviceError(
-                        f"{name} está num número de rosto de outro usuário no facial "
-                        f"{self.base_url}, e a foto salva não está neste PC. Envie uma foto nova pelo botão Foto."
-                    )
-                existing = self._drop_shared_face(registration, name)
+        if existing and self.face_shared_with(registration):
+            if not image_path or not Path(image_path).exists():
+                raise DeviceError(
+                    f"{name} está no mesmo número de rosto (FaceID) de outro usuário no facial "
+                    f"{self.base_url}, e a foto salva não está neste PC. Envie uma foto nova pelo botão Foto."
+                )
+            existing = self._drop_shared_face(registration, name)
         if existing:
             device_id = int(existing["ID"])
             face_ok = True
@@ -1315,13 +1253,19 @@ def _clean_face_id(value: object) -> str:
     """FaceID como texto; vazio quando o usuário não tem rosto.
 
     O export traz o número ("12", "0" = sem rosto). A lista da API traz um
-    endereço no lugar ("https://<facial>/Image/RegisterImg/12.jpg", "-1.jpg"
-    = sem rosto), então o número sai do nome do arquivo.
+    endereço no lugar, com o arquivo contado a partir de 0: FaceID 12 vem
+    como ".../Image/RegisterImg/11.jpg" e "-1.jpg" é sem rosto.
     """
     face_id = str(value or "").strip()
     if "/" in face_id:
-        face_id = face_id.rsplit("/", 1)[-1].split(".", 1)[0]
+        index = face_id.rsplit("/", 1)[-1].split(".", 1)[0]
+        return str(int(index) + 1) if index.isdigit() else ""
     return "" if face_id in ("0", "-1") else face_id
+
+
+def _photo_face_id(stem: str) -> str:
+    """FaceID da foto faceIDs/RegFaceMeun/<arquivo>.jpg: o arquivo conta a partir de 0."""
+    return str(int(stem) + 1) if stem.isdigit() else stem
 
 
 def _face_assigned(user: dict[str, Any]) -> bool:
