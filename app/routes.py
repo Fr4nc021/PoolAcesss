@@ -1099,6 +1099,29 @@ def adm_testar_validade():
     return jsonify({"ok": True, "version": VERSION, "relatorios": reports})
 
 
+@bp.post("/adm/testar-faceid")
+@_blocks_update
+def adm_testar_faceid():
+    """Teste de como cada facial escolhe o FaceID. Só pelo próprio PC."""
+    if not _local_admin_request():
+        return jsonify({"ok": False, "error": "Rode o teste no PC onde o programa está aberto."}), 403
+    from concurrent.futures import ThreadPoolExecutor
+
+    from app import faceid_probe
+
+    photo = None
+    upload = request.files.get("photo")
+    if upload and upload.filename:
+        try:
+            photo = faceid_probe.prepared_photo(upload.read())
+        except DeviceError as exc:
+            return jsonify({"ok": False, "error": f"A foto de teste não abriu: {exc}"}), 400
+    clients = DeviceFleet().clients
+    with ThreadPoolExecutor(max_workers=max(1, len(clients))) as executor:
+        reports = list(executor.map(lambda client: faceid_probe.run_probe(client, photo), clients))
+    return jsonify({"ok": True, "version": VERSION, "relatorios": reports})
+
+
 def _test_forbidden():
     if _local_admin_request():
         return None

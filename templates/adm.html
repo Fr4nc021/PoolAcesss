@@ -548,6 +548,18 @@
           <p>Resultado do teste de validade. Copie todo o texto abaixo e envie para análise.</p>
           <textarea id="validity-result" rows="12" readonly></textarea>
         </div>
+        <div class="config-actions">
+          <button type="button" class="btn btn-secondary" id="btn-test-faceid">Testar FaceID no facial</button>
+          <label class="field faceid-photo">
+            <span>Foto de teste (opcional)</span>
+            <input type="file" id="faceid-photo" accept="image/*">
+          </label>
+        </div>
+        <div id="faceid-test" class="sync-test" hidden aria-live="polite">
+          <p id="faceid-status"></p>
+          <ul id="faceid-affected" class="audit-list" hidden></ul>
+          <textarea id="faceid-result" rows="14" readonly></textarea>
+        </div>
       </fieldset>
 
       <fieldset class="config-card">
@@ -860,6 +872,56 @@
         out.value = "Falha no teste: " + (err.message || err);
       }
       validityButton.disabled = false;
+    });
+  }
+
+  const faceIdButton = document.getElementById("btn-test-faceid");
+  if (faceIdButton) {
+    faceIdButton.addEventListener("click", async () => {
+      if (!window.confirm(
+        "O teste cria um usuário TESTE FACEID em cada facial, envia uma foto de teste algumas vezes para ver qual FaceID o facial dá, e apaga o usuário no final. Se o facial der o FaceID de um sócio, o rosto desse sócio pode mudar: o resultado lista quem foi afetado, para você clicar em \"Enviar foto do sistema\" nele. Leva uns 2 minutos. Continuar?"
+      )) return;
+      const box = document.getElementById("faceid-test");
+      const status = document.getElementById("faceid-status");
+      const affected = document.getElementById("faceid-affected");
+      const out = document.getElementById("faceid-result");
+      const file = document.getElementById("faceid-photo").files[0];
+      faceIdButton.disabled = true;
+      box.hidden = false;
+      affected.hidden = true;
+      affected.replaceChildren();
+      status.textContent = "Testando os faciais... não feche a tela.";
+      out.value = "";
+      try {
+        const body = new FormData();
+        if (file) body.append("photo", file);
+        const response = await fetch("/adm/testar-faceid", {
+          method: "POST",
+          headers: { Accept: "application/json", "X-Acesso-Local": "1" },
+          body,
+        });
+        const data = await response.json();
+        out.value = JSON.stringify(data, null, 2);
+        if (!response.ok || !data.ok) throw new Error(data.error || "Falha no teste.");
+        const hurt = [];
+        for (const report of data.relatorios || []) {
+          if (Array.isArray(report.afetados)) {
+            report.afetados.forEach((row) => hurt.push(`${row.nome} (${row.matricula}) em ${report.facial}: mudou ${row.mudou}`));
+          }
+        }
+        status.textContent = hurt.length
+          ? "Teste terminado. Os sócios abaixo foram afetados: use \"Enviar foto do sistema\" neles na conferência. Copie todo o texto e envie para análise."
+          : "Teste terminado, nenhum sócio afetado. Copie todo o texto abaixo e envie para análise.";
+        hurt.forEach((line) => {
+          const li = document.createElement("li");
+          li.textContent = line;
+          affected.appendChild(li);
+        });
+        affected.hidden = !hurt.length;
+      } catch (err) {
+        status.textContent = "Falha no teste: " + (err.message || err) + " Copie o texto abaixo e envie para análise.";
+      }
+      faceIdButton.disabled = false;
     });
   }
 
