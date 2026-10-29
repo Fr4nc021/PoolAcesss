@@ -214,52 +214,59 @@ class IntelbrasClient:
 
     def face_shared_with(self, registration: str) -> list[str]:
         """Nomes dos outros usuários deste facial que estão no mesmo FaceID da matrícula."""
-        users = self.export_users()
-        if users is None:
-            users = [
-                ExportUser(
-                    user_id=str(user.get("UserID") or ""),
-                    name=str(user.get("Name") or ""),
-                    face_id=_clean_face_id(user.get("FaceID")),
-                    has_model=False,
-                    photo=None,
-                )
-                for user in self.list_users()
-            ]
-        face_id = next((u.face_id for u in users if u.user_id == str(registration)), "")
+        signature, shared = self._face_state(registration)
+        if signature is not None:
+            return shared
+        # Sem export, a lista da API é o que há.
+        users = self.list_users()
+        face_id = next(
+            (_clean_face_id(u.get("FaceID")) for u in users if str(u.get("UserID")) == str(registration)),
+            "",
+        )
         if not face_id:
             return []
         return [
-            u.name or u.user_id
+            str(u.get("Name") or u.get("UserID") or "")
             for u in users
-            if u.face_id == face_id and u.user_id != str(registration)
+            if _clean_face_id(u.get("FaceID")) == face_id and str(u.get("UserID")) != str(registration)
         ]
 
     def _face_signature(self, registration: str) -> FaceSignature:
-        """Modelo do rosto que o facial gerou para a matrícula.
+        return self._face_state(registration)[0]
+
+    def _face_state(self, registration: str) -> tuple[FaceSignature, list[str]]:
+        """Modelo do rosto da matrícula e os nomes de quem mais está no FaceID dela.
 
         O facial só reconhece quem tem a pasta faceIDs/<FaceID>-<nome>/ no
         export. Ter FaceID ou a foto em RegFaceMeun não basta: a foto fica lá
         sem modelo quando o facial não achou o rosto, e o leitor responde
-        "usuário desconhecido".
+        "usuário desconhecido". Cada leitura baixa o export inteiro, com as
+        fotos, então o modelo e o FaceID repetido saem da mesma leitura.
         """
         try:
             raw = self._export_archive()
             with tarfile.open(fileobj=BytesIO(raw), mode="r:gz") as archive:
                 xml_member = archive.extractfile("faceIDs/userdata.xml")
                 if xml_member is None:
-                    return None
+                    return None, []
                 root = ET.fromstring(xml_member.read())
+                keys = root.findall("Key")
                 face_id = next(
                     (
-                        str(key.get("FaceID") or "")
-                        for key in root.findall("Key")
+                        _clean_face_id(key.get("FaceID"))
+                        for key in keys
                         if str(key.get("UserID")) == str(registration)
                     ),
                     "",
                 )
-                if face_id in ("", "0"):
-                    return ()
+                if not face_id:
+                    return (), []
+                shared = [
+                    str(key.get("Name") or key.get("UserID") or "")
+                    for key in keys
+                    if _clean_face_id(key.get("FaceID")) == face_id
+                    and str(key.get("UserID")) != str(registration)
+                ]
                 # O mtime no export é a hora do export e as partes têm tamanho fixo:
                 # só o conteúdo diz se o modelo mudou.
                 prefix = f"faceIDs/{face_id}-"
@@ -275,8 +282,8 @@ class IntelbrasClient:
                     found = True
         except (httpx.HTTPError, tarfile.TarError, ET.ParseError, OSError, EOFError) as exc:
             logger.warning("Não foi possível ler o export do facial %s: %s", self.base_url, exc)
-            return None
-        return (face_id, digest.hexdigest()) if found else ()
+            return None, []
+        return ((face_id, digest.hexdigest()) if found else ()), shared
 
     def _face_confirmed(
         self,
@@ -284,17 +291,23 @@ class IntelbrasClient:
         *,
         previous: FaceSignature = (),
         retries: int = FACE_CONFIRM_RETRIES,
+        name: str = "",
     ) -> bool:
-        """Confirma que o facial gerou um modelo novo do rosto para a matrícula."""
+        """Confirma que o facial gerou um modelo novo do rosto para a matrícula.
+
+        Um modelo novo num FaceID de outro usuário não vale: levanta FaceIDConflict.
+        """
         for attempt in range(retries):
             user = self.find_user_by_registration(registration)
             if user and _face_assigned(user):
-                signature = self._face_signature(registration)
+                signature, shared = self._face_state(registration)
                 if signature is None:
                     # Sem export não dá para ver o modelo: só vale o FaceStatus do facial.
                     if user.get("FaceStatus") in (1, "1", True):
                         return True
                 elif signature and signature != previous:
+                    if shared:
+                        self._raise_conflict(registration, name or str(user.get("Name") or ""), shared)
                     return True
             if attempt + 1 < retries:
                 time.sleep(FACE_CONFIRM_DELAY)
@@ -492,23 +505,8 @@ class IntelbrasClient:
                         exc,
                     )
                     continue
-                if self._face_confirmed(registration, previous=previous):
-                    others = self.face_shared_with(registration)
-                    if others:
-                        # Outro método não muda o FaceID do usuário: para aqui.
-                        logger.error(
-                            "Face de %s (reg=%s) ficou no FaceID de %s em %s",
-                            name,
-                            registration,
-                            ", ".join(others),
-                            self.base_url,
-                        )
-                        raise FaceIDConflict(
-                            f"O facial {self.base_url} gravou o rosto de {name} no mesmo número "
-                            f"de rosto (FaceID) de {', '.join(others)}. Nesse estado o rosto de um "
-                            "libera a entrada no nome do outro. Use o botão Foto em cada um para "
-                            "refazer, ou confira em ADM > Conferir fotos no Intelbras."
-                        )
+                # FaceID repetido levanta FaceIDConflict: outro método não muda o FaceID, então para aqui.
+                if self._face_confirmed(registration, previous=previous, name=name):
                     logger.info(
                         "Face confirmada via %s na rodada %s (reg=%s)",
                         label,
@@ -525,6 +523,21 @@ class IntelbrasClient:
             if round_num + 1 < FACE_SEND_ROUNDS:
                 time.sleep(1.5)
         return False
+
+    def _raise_conflict(self, registration: str, name: str, others: list[str]) -> None:
+        logger.error(
+            "Face de %s (reg=%s) ficou no FaceID de %s em %s",
+            name,
+            registration,
+            ", ".join(others),
+            self.base_url,
+        )
+        raise FaceIDConflict(
+            f"O facial {self.base_url} gravou o rosto de {name} no mesmo número "
+            f"de rosto (FaceID) de {', '.join(others)}. Nesse estado o rosto de um "
+            "libera a entrada no nome do outro. Use o botão Foto em cada um para "
+            "refazer, ou confira em ADM > Conferir fotos no Intelbras."
+        )
 
     def _send_face_via_data_uri(
         self,
@@ -661,6 +674,18 @@ class IntelbrasClient:
                 self._check(response.json(), "user/set acesso")
         except httpx.HTTPError as exc:
             raise DeviceError(f"Falha ao liberar relé e validade sempre: {exc}") from exc
+
+    def rename_user(self, registration: str, name: str) -> None:
+        """Acerta o nome no facial sem mexer no rosto."""
+        known = self.find_user_by_registration(registration)
+        if not known:
+            raise DeviceError(f"{name} não está no facial {self.base_url}.")
+        self._grant_always_access(
+            device_user_id=int(known["ID"]),
+            registration=registration,
+            name=name,
+            current=known,
+        )
 
     def update_user(
         self,

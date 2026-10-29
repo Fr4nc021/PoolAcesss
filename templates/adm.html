@@ -82,6 +82,12 @@
 
     <div class="panel-actions">
       <button type="button" class="btn btn-secondary" id="btn-face-audit">Conferir fotos no Intelbras</button>
+      <button type="button" class="btn btn-secondary" id="btn-face-fix">Corrigir tudo que for seguro</button>
+    </div>
+    <div id="face-fix" class="sync-test face-audit" hidden aria-live="polite">
+      <p id="face-fix-status"></p>
+      <progress id="face-fix-progress" max="1" value="0" hidden></progress>
+      <div id="face-fix-result"></div>
     </div>
     <div id="face-audit" class="sync-test face-audit" hidden aria-live="polite">
       <p id="face-audit-status"></p>
@@ -885,23 +891,28 @@
     };
     const badge = { erro: ["status-expired", "Problema"], aviso: ["status-warning", "Conferir"], ok: ["status-ok", "OK"] };
 
-    async function redo(row, button) {
-      if (!window.confirm(
-        `Apagar ${row.name} dos faciais da piscina e cadastrar de novo com a foto salva no sistema?`
-      )) return;
-      button.disabled = true;
-      button.textContent = "Refazendo...";
+    async function redo(row, button, source, deviceUrl) {
+      const question = source === "intelbras"
+        ? `Usar a foto do Intelbras como foto de ${row.name}? Ela passa a ser a foto do sistema e ${row.name} é cadastrado de novo com ela nos faciais da piscina.`
+        : `Cadastrar ${row.name} de novo nos faciais da piscina com a foto salva no sistema?`;
+      if (!window.confirm(question)) return;
+      const label = button.textContent;
+      const siblings = button.parentElement.querySelectorAll("button");
+      siblings.forEach((b) => { b.disabled = true; });
+      button.textContent = "Enviando...";
       try {
-        const response = await fetch(`/adm/membros/${row.member_id}/refazer-facial`, {
+        const path = source === "intelbras" ? "usar-foto-intelbras" : "refazer-facial";
+        const response = await fetch(`/adm/membros/${row.member_id}/${path}`, {
           method: "POST",
-          headers: { Accept: "application/json" },
+          headers: { Accept: "application/json", "Content-Type": "application/json" },
+          body: JSON.stringify({ url: deviceUrl }),
         });
         const data = await response.json();
-        if (!response.ok || !data.ok) throw new Error(data.error || "Falha ao refazer.");
-        button.textContent = "Refeito — confira de novo";
+        if (!response.ok || !data.ok) throw new Error(data.error || "Falha ao enviar.");
+        button.textContent = "Feito — confira de novo";
       } catch (err) {
-        button.disabled = false;
-        button.textContent = "Refazer no facial";
+        siblings.forEach((b) => { b.disabled = false; });
+        button.textContent = label;
         window.alert(err.message || String(err));
       }
     }
@@ -939,12 +950,20 @@
             state.appendChild(el("span", `badge ${cls}`, text));
             for (const msg of [...row.problems, ...row.warnings]) state.appendChild(el("div", "audit-msg", msg));
             tr.appendChild(state);
-            const action = el("td", "actions");
+            const action = el("td", "actions audit-actions");
             if (row.status !== "ok" && !row.blocked) {
-              const button = el("button", "btn btn-secondary", "Refazer no facial");
-              button.type = "button";
-              button.addEventListener("click", () => redo(row, button));
-              action.appendChild(button);
+              if (row.our_photo) {
+                const button = el("button", "btn btn-secondary", "Enviar foto do sistema");
+                button.type = "button";
+                button.addEventListener("click", () => redo(row, button, "sistema", device.url));
+                action.appendChild(button);
+              }
+              if (row.has_device_photo) {
+                const button = el("button", "btn btn-secondary", "Usar foto do Intelbras");
+                button.type = "button";
+                button.addEventListener("click", () => redo(row, button, "intelbras", device.url));
+                action.appendChild(button);
+              }
             }
             tr.appendChild(action);
             body.appendChild(tr);
@@ -986,7 +1005,7 @@
       });
     });
 
-    auditButton.addEventListener("click", async () => {
+    async function runAudit() {
       auditButton.disabled = true;
       auditBox.hidden = false;
       auditStatus.textContent = "Lendo os faciais e comparando sócio a sócio... pode levar alguns segundos.";
@@ -999,14 +1018,105 @@
         const data = await response.json();
         if (!response.ok || !data.ok) throw new Error(data.error || "Falha na conferência.");
         lastAudit = data;
-        auditStatus.textContent = `Conferido em ${new Date().toLocaleTimeString("pt-BR")}. "Refazer no facial" apaga o sócio do facial e cadastra de novo com a foto do sistema.`;
+        auditStatus.textContent = `Conferido em ${new Date().toLocaleTimeString("pt-BR")}. Os botões de cada linha cadastram o sócio de novo nos faciais da piscina com a foto escolhida.`;
         auditFilters.hidden = false;
         render(data);
       } catch (err) {
         auditStatus.textContent = "Falha na conferência: " + (err.message || err);
       }
       auditButton.disabled = false;
+    }
+    auditButton.addEventListener("click", runAudit);
+
+    const fixButton = document.getElementById("btn-face-fix");
+    const fixBox = document.getElementById("face-fix");
+    const fixStatus = document.getElementById("face-fix-status");
+    const fixProgress = document.getElementById("face-fix-progress");
+    const fixResult = document.getElementById("face-fix-result");
+
+    function renderFix(state) {
+      fixBox.hidden = false;
+      fixResult.replaceChildren();
+      if (state.running) {
+        if (state.phase === "conferindo") {
+          fixStatus.textContent = "Conferindo os faciais para saber o que corrigir...";
+          fixProgress.hidden = true;
+        } else {
+          fixStatus.textContent = `Corrigindo ${state.done} de ${state.total}${state.current ? " — " + state.current : ""}. Os dois faciais trabalham ao mesmo tempo; pode deixar a tela aberta.`;
+          fixProgress.hidden = false;
+          fixProgress.max = Math.max(1, state.total);
+          fixProgress.value = state.done;
+        }
+        return;
+      }
+      fixProgress.hidden = true;
+      if (state.error) {
+        fixStatus.textContent = state.error;
+        return;
+      }
+      const failed = (state.results || []).filter((item) => !item.ok);
+      const fixed = (state.results || []).length - failed.length;
+      fixStatus.textContent = state.total
+        ? `Pronto: ${fixed} corrigido(s), ${failed.length} com falha.`
+        : "Nada para corrigir sozinho.";
+      const list = (title, items, text) => {
+        if (!items.length) return;
+        fixResult.appendChild(el("h4", null, title));
+        const ul = el("ul", "audit-list");
+        items.forEach((item) => ul.appendChild(el("li", null, text(item))));
+        fixResult.appendChild(ul);
+      };
+      list("Corrigidos", (state.results || []).filter((item) => item.ok), (i) => `${i.name} (${i.label}): ${i.message}`);
+      list("Falharam", failed, (i) => `${i.name} (${i.label}): ${i.message}`);
+      list("Precisam de decisão sua", state.pending || [], (i) => `${i.name} (${i.label}): ${i.message}`);
+    }
+
+    async function pollFix() {
+      try {
+        const response = await fetch("/adm/corrigir-fotos", { headers: { Accept: "application/json" } });
+        const state = await response.json();
+        if (!state.phase) return;
+        renderFix(state);
+        if (state.running) {
+          fixButton.disabled = true;
+          setTimeout(pollFix, 1500);
+        } else {
+          fixButton.disabled = false;
+          if (fixButton.dataset.started) {
+            delete fixButton.dataset.started;
+            runAudit();
+          }
+        }
+      } catch (err) {
+        setTimeout(pollFix, 3000);
+      }
+    }
+
+    fixButton.addEventListener("click", async () => {
+      if (!window.confirm(
+        "O sistema vai conferir os faciais e corrigir sozinho, com a foto salva no sistema: FaceID repetido, sócio sem rosto ou fora do facial, vencido que continua no facial e nome diferente. Fotos que parecem diferentes ficam para você decidir. Continuar?"
+      )) return;
+      fixButton.disabled = true;
+      try {
+        const response = await fetch("/adm/corrigir-fotos", {
+          method: "POST",
+          headers: { Accept: "application/json" },
+        });
+        const data = await response.json();
+        if (!data.ok) throw new Error(data.error || "Não foi possível começar.");
+        fixButton.dataset.started = "1";
+        pollFix();
+      } catch (err) {
+        fixButton.disabled = false;
+        window.alert(err.message || String(err));
+      }
     });
+
+    // Correção que já estava rodando (tela recarregada) continua aparecendo.
+    fetch("/adm/corrigir-fotos", { headers: { Accept: "application/json" } })
+      .then((response) => response.json())
+      .then((state) => { if (state.running) { fixButton.dataset.started = "1"; pollFix(); } })
+      .catch(() => {});
   }
 
   const testForm = document.getElementById("test-form");
