@@ -58,7 +58,8 @@ class PhotoDevice(FakeDevice):
             for item in src.getmembers():
                 dst.addfile(item, src.extractfile(item))
             for face_id, data in self.photos.items():
-                info = tarfile.TarInfo(f"faceIDs/RegFaceMeun/{face_id}.jpg")
+                # Como o facial real: o arquivo conta a partir de 0.
+                info = tarfile.TarInfo(f"faceIDs/RegFaceMeun/{int(face_id) - 1}.jpg")
                 info.size = len(data)
                 dst.addfile(info, io.BytesIO(data))
         return out.getvalue()

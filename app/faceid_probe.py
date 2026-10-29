@@ -1,16 +1,15 @@
-"""Mostra como cada facial liga o ID interno de cada usuário ao FaceID do rosto.
+"""Mostra como cada facial guarda o rosto de cada usuário (ID, FaceID, modelo e foto).
 
-O facial grava o rosto de um usuário novo no número do ID interno dele e
-escolhe esse ID sozinho. Nos sócios antigos os dois números não batem, então
-um usuário novo podia ganhar um ID igual ao FaceID de outro sócio e trocar o
-rosto desse sócio (Paula no FaceID do Flavio, o teste anterior no Winston).
+O teste só de leitura da térmica mostrou que o ID interno não tem relação
+com o FaceID, e que a foto guardada e o número da lista contam a partir de
+0 (FaceID 12 = RegFaceMeun/11.jpg = RegisterImg/11.jpg).
 
-1. Só leitura: o mapa ID -> FaceID de cada usuário (matrícula mascarada) e,
-   pelo nome, quem tem o ID igual ao FaceID de outro.
-2. Só com uma foto real enviada pela tela: cadastra um usuário de teste pelo
-   caminho novo (ID livre, com reserva quando preciso), mostra o ID e o
-   FaceID que ele ganhou e apaga. Antes e depois compara o modelo e a foto de
-   cada FaceID; quem mudou aparece pelo nome para refazer.
+1. Só leitura: para cada usuário (matrícula mascarada), o ID, o FaceID, se
+   tem modelo do rosto e se tem foto guardada, e se a lista bate com o export.
+2. Só com uma foto real enviada pela tela: cadastra um usuário de teste
+   como um sócio, mostra o FaceID que ele ganhou e de quem esse número já
+   era, e apaga. Antes e depois compara o modelo e a foto de cada FaceID;
+   quem mudou aparece pelo nome para refazer.
 """
 
 from __future__ import annotations
@@ -30,8 +29,8 @@ from app.intelbras_client import (
     DeviceError,
     IntelbrasClient,
     _clean_face_id,
+    _photo_face_id,
     _prepare_jpeg_base64,
-    is_reserve,
 )
 
 PROBE_REGISTRATION = "APFIDTESTE"
@@ -63,7 +62,8 @@ def _snapshot(client: IntelbrasClient) -> dict[str, Any]:
                 face_id = parts[1].split("-", 1)[0]
                 models.setdefault(face_id, hashlib.sha256()).update(fileobj.read())
             elif item.name.startswith("faceIDs/RegFaceMeun/"):
-                photos[item.name.rsplit("/", 1)[-1].split(".", 1)[0]] = hashlib.sha256(fileobj.read()).hexdigest()
+                stem = item.name.rsplit("/", 1)[-1].split(".", 1)[0]
+                photos[_photo_face_id(stem)] = hashlib.sha256(fileobj.read()).hexdigest()
     users = [
         {
             "registration": str(key.get("UserID") or ""),
@@ -86,50 +86,40 @@ def _summary(snap: dict[str, Any]) -> dict[str, Any]:
     owners: dict[str, list[str]] = {}
     for user in with_face:
         owners.setdefault(user["face_id"], []).append(_mask(user["registration"]))
+    in_use = {u["face_id"] for u in with_face}
     return {
         "usuarios": len(users),
-        "reservas": sum(1 for u in users if is_reserve(u["registration"])),
         "com_faceid": len(with_face),
         "repetidos": {face_id: regs for face_id, regs in owners.items() if len(regs) > 1},
-        "modelos_sem_usuario": sorted(set(snap["models"]) - {u["face_id"] for u in with_face}),
+        "com_modelo_sem_foto": sorted(_mask(u["registration"]) for u in with_face if u["face_id"] not in snap["photos"]),
+        "sem_modelo": sorted(_mask(u["registration"]) for u in with_face if u["face_id"] not in snap["models"]),
+        "modelos_sem_usuario": sorted(set(snap["models"]) - in_use),
+        "fotos_sem_usuario": sorted(set(snap["photos"]) - in_use),
     }
 
 
-def _id_map(client: IntelbrasClient, snap: dict[str, Any]) -> dict[str, Any]:
-    """ID interno x FaceID de cada usuário e quem tem o ID igual ao FaceID de outro."""
+def _face_map(client: IntelbrasClient, snap: dict[str, Any]) -> dict[str, Any]:
+    """ID, FaceID, modelo e foto de cada usuário, e se a lista da API bate com o export."""
     api = client.list_users()
     by_registration = {str(u.get("UserID") or ""): u for u in api}
-    face_owner = {u["face_id"]: u for u in snap["users"] if u["face_id"]}
     rows: list[dict[str, Any]] = []
-    collisions: list[dict[str, str]] = []
     for user in snap["users"]:
-        registration = user["registration"]
-        listed = by_registration.get(registration) or {}
-        device_id = str(listed.get("ID") or user["device_id"] or "")
+        listed = by_registration.get(user["registration"]) or {}
+        face_id = user["face_id"]
         rows.append(
             {
-                "matricula": _mask(registration),
-                "id": device_id or None,
-                "faceid": user["face_id"] or None,
+                "matricula": _mask(user["registration"]),
+                "id": str(listed.get("ID") or user["device_id"] or "") or None,
+                "faceid": face_id or None,
                 "faceid_na_lista": _clean_face_id(listed.get("FaceID")) or None,
-                "reserva": is_reserve(registration),
+                "tem_modelo": bool(face_id) and face_id in snap["models"],
+                "tem_foto": bool(face_id) and face_id in snap["photos"],
             }
         )
-        owner = face_owner.get(device_id)
-        if owner and owner["registration"] != registration and not is_reserve(registration):
-            collisions.append(
-                {
-                    "nome": user["name"],
-                    "matricula": registration,
-                    "id": device_id,
-                    "e_o_faceid_de": owner["name"],
-                    "matricula_dele": owner["registration"],
-                }
-            )
     return {
         "usuarios_na_lista": len(api),
         "usuarios_no_export": len(snap["users"]),
-        "id_igual_ao_faceid_de_outro": collisions,
+        "lista_bate_com_export": all(row["faceid"] == row["faceid_na_lista"] for row in rows),
         "mapa": rows,
     }
 
@@ -161,7 +151,7 @@ def _cleanup(client: IntelbrasClient) -> Any:
 
 def _create_test(client: IntelbrasClient, photo: bytes, before: dict[str, Any]) -> dict[str, Any]:
     """Cadastra o usuário de teste pelo caminho dos sócios e mostra os números que ele ganhou."""
-    result: dict[str, Any] = {"teste": "cadastro pelo caminho novo (ID livre)"}
+    result: dict[str, Any] = {"teste": "cadastro como um sócio"}
     with tempfile.TemporaryDirectory() as tmp:
         path = Path(tmp) / "teste.jpg"
         path.write_bytes(photo)
@@ -172,11 +162,17 @@ def _create_test(client: IntelbrasClient, photo: bytes, before: dict[str, Any]) 
             result["erro"] = str(exc)
     after = _snapshot(client)
     mine = next((u for u in after["users"] if u["registration"] == PROBE_REGISTRATION), None)
-    result["faceid_dado"] = (mine or {}).get("face_id") or None
-    result["gerou_modelo"] = bool(mine and mine["face_id"] in after["models"])
-    if mine and result.get("id_dado"):
-        result["faceid_igual_ao_id"] = mine["face_id"] == result["id_dado"]
-    result["reservas_criadas"] = _summary(after)["reservas"] - _summary(before)["reservas"]
+    face_id = (mine or {}).get("face_id") or ""
+    used = sorted(int(u["face_id"]) for u in before["users"] if u["face_id"].isdigit())
+    result["faceid_dado"] = face_id or None
+    result["gerou_modelo"] = bool(face_id) and face_id in after["models"]
+    result["ja_era_de"] = [
+        _mask(u["registration"])
+        for u in before["users"]
+        if face_id and u["face_id"] == face_id and u["registration"] != PROBE_REGISTRATION
+    ]
+    result["menor_livre_antes"] = next((n for n in range(1, len(used) + 2) if n not in used), 1)
+    result["maior_antes"] = used[-1] if used else None
     return result
 
 
@@ -191,7 +187,7 @@ def run_probe(client: IntelbrasClient, photo: Optional[bytes] = None) -> dict[st
         _cleanup(client)
         before = _snapshot(client)
         report["antes"] = _summary(before)
-        report["ids"] = _id_map(client, before)
+        report["rostos"] = _face_map(client, before)
         if photo:
             report["cadastro"] = _create_test(client, photo, before)
     except (DeviceError, httpx.HTTPError, tarfile.TarError, ET.ParseError, OSError) as exc:
