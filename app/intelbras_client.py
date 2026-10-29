@@ -63,8 +63,12 @@ class FaceIDConflict(DeviceError):
     """O rosto do sócio ficou no mesmo FaceID de outro usuário do facial.
 
     O facial reconhece pelo FaceID: com dois usuários nele, o rosto de um
-    libera a entrada no nome do outro.
+    libera a entrada no nome do outro. others são as matrículas dos outros.
     """
+
+    def __init__(self, message: str, others: Optional[list[str]] = None) -> None:
+        super().__init__(message)
+        self.others = others or []
 
 
 @dataclass
@@ -528,11 +532,18 @@ class IntelbrasClient:
             ", ".join(others),
             self.base_url,
         )
+        exported = self.export_users() or []
+        face_id = next((u.face_id for u in exported if u.user_id == str(registration)), "")
+        registrations = [
+            u.user_id for u in exported if face_id and u.face_id == face_id and u.user_id != str(registration)
+        ]
+        # O facial junta no mesmo FaceID um rosto que ele acha que já conhece:
+        # quase sempre a foto salva é da outra pessoa ou parecida demais com ela.
         raise FaceIDConflict(
-            f"O facial {self.base_url} gravou o rosto de {name} no mesmo número "
-            f"de rosto (FaceID) de {', '.join(others)}. Nesse estado o rosto de um "
-            "libera a entrada no nome do outro. Use o botão Foto em cada um para "
-            "refazer, ou confira em ADM > Conferir fotos no Intelbras."
+            f"O facial {self.base_url} achou que a foto de {name} é o rosto de "
+            f"{', '.join(others)} e juntou os dois no mesmo FaceID. Confira se a foto "
+            f"salva de {name} é mesmo dela/dele; se não for, tire uma foto nova pelo botão Foto.",
+            registrations,
         )
 
     def _send_face_via_data_uri(

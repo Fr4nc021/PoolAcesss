@@ -22,7 +22,7 @@ from typing import Any, Optional
 
 from app import db, face_audit, updater
 from app.config import registration_pools, selected_pools
-from app.intelbras_client import DeviceError, IntelbrasClient, face_photo, public_media_url
+from app.intelbras_client import DeviceError, FaceIDConflict, IntelbrasClient, face_photo, public_media_url
 from app.netcheck import lan_ip_problem
 
 logger = logging.getLogger(__name__)
@@ -99,16 +99,48 @@ def plan(report: dict[str, Any]) -> tuple[list[Fix], list[dict[str, str]]]:
     return fixes, pending
 
 
-def recreate_on_device(client: IntelbrasClient, member: db.Member, photo: Path) -> None:
-    """Apaga o sócio do facial e cadastra de novo com a foto: ele ganha um FaceID novo."""
+def recreate_on_device(
+    client: IntelbrasClient,
+    member: db.Member,
+    photo: Path,
+    *,
+    repair_others: bool = True,
+) -> None:
+    """Apaga o sócio do facial e cadastra de novo com a foto: ele ganha um FaceID novo.
+
+    Se o facial juntar a foto no FaceID de outro sócio, o cadastro novo sai
+    e, ao sair, leva o rosto do outro junto. Então o outro é refeito com a
+    foto dele, para não ficar sem entrar por causa deste.
+    """
     face_url = public_media_url(photo.name)
     client.delete_user(registration=member.registration)
-    client.create_user_with_face(
-        member.name,
-        photo,
-        registration=member.registration,
-        face_public_url=face_url,
-    )
+    try:
+        client.create_user_with_face(
+            member.name,
+            photo,
+            registration=member.registration,
+            face_public_url=face_url,
+        )
+    except FaceIDConflict as exc:
+        if not repair_others:
+            raise
+        notes = [_repair_other(client, registration) for registration in exc.others]
+        raise FaceIDConflict(" ".join([str(exc), *[note for note in notes if note]]), exc.others) from exc
+
+
+def _repair_other(client: IntelbrasClient, registration: str) -> str:
+    other = db.get_member_by_registration(registration)
+    if other is None or other.access_blocked or other.is_expired:
+        return ""
+    photo = Path(other.photo_path) if other.photo_path else None
+    if photo is None or not photo.is_file():
+        return f"{other.name} pode ter ficado sem rosto e não tem foto neste PC: use o botão Foto nele."
+    try:
+        recreate_on_device(client, other, face_photo(photo), repair_others=False)
+    except DeviceError as exc:
+        logger.error("Não deu para refazer %s depois do FaceID repetido: %s", registration, exc)
+        return f"{other.name} pode ter ficado sem rosto: refaça com \"Enviar foto do sistema\"."
+    return f"{other.name} foi refeito com a foto dele."
 
 
 def pool_urls(member: db.Member) -> dict[str, str]:
