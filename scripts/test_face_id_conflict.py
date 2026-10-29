@@ -38,7 +38,15 @@ class PhotoDevice(FakeDevice):
     def handler(self, request: httpx.Request) -> httpx.Response:
         if request.url.path == "/api/user/export" and not self.export_works:
             return httpx.Response(500)
-        return super().handler(request)
+        response = super().handler(request)
+        if request.url.path == "/api/user/set" and request.headers.get("content-type", "").startswith("application/json"):
+            import json
+
+            item = json.loads(request.content)["data"]["item"][0]
+            user = self.users.get(str(item.get("ID")))
+            if user and item.get("Name"):
+                user["Name"] = item["Name"]
+        return response
 
     def _export(self) -> bytes:
         import io
@@ -168,6 +176,120 @@ def test_audit_finds_each_problem(tmp: Path) -> None:
     assert section["rows"][0]["status"] == "erro", "problemas vêm primeiro"
 
 
+def _fix_env(tmp: Path, name: str) -> tuple[PhotoDevice, FakeClient]:
+    import app.face_fix as face_fix
+    import app.routes as routes
+
+    config.DB_PATH = tmp / f"{name}.db"
+    db.DB_PATH = config.DB_PATH
+    db.init_db()
+    device = PhotoDevice("http://facial-t")
+    device.next_id = 100
+    client = FakeClient(device)
+    pools = [{"id": "termica", "label": "Piscina térmica", "url": device.url}]
+    config.registration_pools = lambda: pools  # noqa: E731
+    for module in (face_audit, face_fix, routes):
+        module.registration_pools = lambda: pools  # noqa: E731
+        module.IntelbrasClient = lambda base_url, **_kw: client  # noqa: E731
+    # Sem FaceUrl: a foto vai em base64, como quando o facial não alcança o PC.
+    face_fix.public_media_url = lambda _name: ""  # noqa: E731
+    routes.public_media_url = lambda _name: ""  # noqa: E731
+    face_fix.lan_ip_problem = lambda: None  # noqa: E731
+    routes.lan_ip_problem = lambda: None  # noqa: E731
+    return device, client
+
+
+def test_fix_all_safe(tmp: Path) -> None:
+    import threading
+
+    import app.face_fix as face_fix
+
+    device, client = _fix_env(tmp, "corrigir")
+    later = datetime.now() + timedelta(days=10)
+
+    def member(name: str, reg: str, photo, expires=later) -> db.Member:
+        return db.create_member(
+            name=name, registration=reg, device_user_id=None,
+            photo_path=str(photo) if photo else None, expires_at=expires, pool="termica",
+        )
+
+    homem = ic.prepare_face_photo(_photo(tmp / "fix_homem.jpg", size=(480, 640)))
+    socia = ic.prepare_face_photo(_photo(tmp / "fix_socia.jpg", size=(500, 660)))
+    member("Homem", "H9", homem)
+    member("Socia", "S9", socia)
+    device.users["1"] = {"ID": "1", "UserID": "H9", "Name": "Homem", "FaceID": "70"}
+    device.users["2"] = {"ID": "2", "UserID": "S9", "Name": "Socia", "FaceID": "70"}
+    device.templates["70"] = b"modelo"
+
+    member("Faltando", "F9", homem)
+    member("Vencido", "V9", homem, expires=datetime.now() - timedelta(days=1))
+    device.users["3"] = {"ID": "3", "UserID": "V9", "Name": "Vencido", "FaceID": "0"}
+    member("Nome Certo", "N9", homem)
+    device.users["4"] = {"ID": "4", "UserID": "N9", "Name": "Nome Errado", "FaceID": "71"}
+    device.templates["71"] = b"modelo71"
+    member("Sem Foto", "P9", None)
+    device.users["5"] = {"ID": "5", "UserID": "X9", "Name": "Funcionario", "FaceID": "72"}
+    device.templates["72"] = b"modelo72"
+    device.next_face = 500
+
+    ok, message = face_fix.start()
+    assert ok, message
+    for thread in threading.enumerate():
+        if thread.name == "face-fix":
+            thread.join(timeout=30)
+    state = face_fix.status()
+    assert not state["running"] and not state["error"], state
+    results = {item["name"]: item for item in state["results"]}
+    assert all(item["ok"] for item in state["results"]), state["results"]
+    assert results["Homem"]["action"] == results["Socia"]["action"] == "recriar"
+    faces = {device._by_userid(reg)["FaceID"] for reg in ("H9", "S9")}
+    assert len(faces) == 2 and "70" not in faces, "cada um ganhou um FaceID novo"
+    assert device._by_userid("F9") is not None, "quem faltava foi cadastrado"
+    assert device._by_userid("V9") is None, "vencido saiu do facial"
+    assert device._by_userid("N9")["Name"] == "Nome Certo"
+    pending = " ".join(f"{item['name']}: {item['message']}" for item in state["pending"])
+    assert "Sem Foto" in pending and "Funcionario" in pending, pending
+    assert device._by_userid("X9") is not None, "usuário sem cadastro não é apagado sozinho"
+
+    again, _ = face_fix.plan(face_audit.run_audit(thumbnails=False))
+    assert not again, f"depois da correção não sobra nada seguro para corrigir: {again}"
+
+
+def test_use_device_photo(tmp: Path) -> None:
+    from app.main import create_app
+
+    device, client = _fix_env(tmp, "usar_foto")
+    photo = ic.prepare_face_photo(_photo(tmp / "sistema.jpg", size=(480, 640)))
+    created = client.register_member("Clara", photo, registration="C1", image_ready=True)
+    member = db.create_member(
+        name="Clara", registration="C1", device_user_id=created.device_user_id,
+        photo_path=str(photo), expires_at=datetime.now() + timedelta(days=5), pool="termica",
+    )
+    # A foto boa é a que está no facial; a do sistema é outra.
+    device_photo = ic.prepare_face_photo(_photo(tmp / "facial.jpg", size=(520, 700)))
+    device.photos[device._by_userid("C1")["FaceID"]] = device_photo.read_bytes()
+
+    app = create_app()
+    response = app.test_client().post(
+        f"/adm/membros/{member.id}/usar-foto-intelbras",
+        json={"url": device.url},
+        headers={"Accept": "application/json"},
+    )
+    data = response.get_json()
+    assert response.status_code == 200 and data["ok"], data
+    updated = db.get_member(member.id)
+    assert updated.photo_path != str(photo), "a foto do facial virou a foto do sistema"
+    assert Path(updated.photo_path).is_file()
+    assert photo.is_file(), "a foto antiga não é apagada"
+
+    bad = app.test_client().post(
+        f"/adm/membros/{member.id}/usar-foto-intelbras",
+        json={"url": "http://outro"},
+        headers={"Accept": "application/json"},
+    )
+    assert bad.status_code == 400, "só aceita os faciais configurados"
+
+
 def test_photo_difference() -> None:
     from io import BytesIO
 
@@ -202,6 +324,8 @@ def main() -> None:
         test_renew_recreates_shared_face(root)
         test_next_face_id_needs_export()
         test_audit_finds_each_problem(root)
+        test_fix_all_safe(root)
+        test_use_device_photo(root)
         test_photo_difference()
     print("face id conflict ok")
 

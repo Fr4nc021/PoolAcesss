@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import base64
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Optional
@@ -87,36 +88,49 @@ def _member_check(
     user: Optional[ExportUser],
     users: list[ExportUser],
     our_photo: Optional[bytes],
+    thumbnails: bool = True,
 ) -> dict[str, Any]:
     should_be_there = not member.access_blocked and not member.is_expired
     problems: list[str] = []
     warnings: list[str] = []
+    # Códigos para a correção automática; o texto é só para a tela.
+    codes: list[str] = []
+    shared: list[str] = []
     difference = None
     if user is None:
         if should_be_there:
+            codes.append("missing")
             problems.append("Não está no facial: não entra.")
     else:
         if not should_be_there:
+            codes.append("expired_on_device")
             problems.append("Exame vencido, mas continua no facial.")
-        if not user.face_id or not user.has_model:
+        elif not user.face_id or not user.has_model:
+            codes.append("no_model")
             problems.append("Sem modelo do rosto no facial: aparece como desconhecido.")
         if user.face_id:
-            others = [
+            shared = [
                 other.name or other.user_id
                 for other in users
                 if other.face_id == user.face_id and other.user_id != user.user_id
             ]
-            if others:
+            if shared and should_be_there:
+                codes.append("shared")
                 problems.append(
-                    f"Mesmo FaceID {user.face_id} de {', '.join(others)}: o rosto de um libera no nome do outro."
+                    f"Mesmo FaceID {user.face_id} de {', '.join(shared)}: o rosto de um libera no nome do outro. "
+                    "A foto do Intelbras é uma só para os dois: veja de quem ela é."
                 )
-        if user.name and not _same_name(user.name, member.name):
+        if should_be_there and user.name and not _same_name(user.name, member.name):
+            codes.append("name")
             problems.append(f"Nome no facial é \"{user.name}\".")
-        difference = photo_difference(our_photo, user.photo)
-        if difference is not None and difference >= PHOTO_DIFF_WARN:
-            warnings.append("A foto do facial parece diferente da salva no sistema. Compare as duas.")
-        if our_photo is None and should_be_there:
-            warnings.append("A foto do sistema não está neste PC.")
+        if should_be_there:
+            difference = photo_difference(our_photo, user.photo)
+            if difference is not None and difference >= PHOTO_DIFF_WARN:
+                codes.append("photo_diff")
+                warnings.append("A foto do facial parece diferente da salva no sistema. Compare as duas.")
+    if our_photo is None and should_be_there:
+        codes.append("no_local_photo")
+        warnings.append("A foto do sistema não está neste PC.")
     status = "erro" if problems else ("aviso" if warnings else "ok")
     return {
         "member_id": member.id,
@@ -126,62 +140,75 @@ def _member_check(
         "status": status,
         "problems": problems,
         "warnings": warnings,
+        "codes": codes,
+        "shared_with": shared,
         "face_id": user.face_id if user else None,
         "device_name": user.name if user else None,
         "difference": difference,
-        "device_photo": _thumb(user.photo) if user else None,
+        "has_device_photo": bool(user and user.photo),
+        "device_photo": _thumb(user.photo) if user and thumbnails else None,
     }
 
 
-def run_audit() -> dict[str, Any]:
-    """Uma seção por facial: cada sócio que deveria estar nele e os usuários sem cadastro."""
-    members = db.list_members()
-    photos: dict[int, Optional[bytes]] = {}
-    thumbs: dict[int, Optional[str]] = {}
-    devices: list[dict[str, Any]] = []
-    for pool in registration_pools():
-        url = pool["url"]
-        section: dict[str, Any] = {"url": url, "label": pool["label"], "ok": True, "rows": [], "orphans": []}
-        devices.append(section)
-        users = IntelbrasClient(base_url=url).export_users(with_photos=True)
-        if users is None:
-            section["ok"] = False
-            section["error"] = "Não foi possível ler o export deste facial. Confira se ele está ligado."
+def _audit_device(
+    pool: dict[str, str],
+    members: list[db.Member],
+    photos: dict[int, Optional[bytes]],
+    thumbs: dict[int, Optional[str]],
+    thumbnails: bool,
+) -> dict[str, Any]:
+    url = pool["url"]
+    section: dict[str, Any] = {"url": url, "label": pool["label"], "ok": True, "rows": [], "orphans": []}
+    users = IntelbrasClient(base_url=url).export_users(with_photos=True)
+    if users is None:
+        section["ok"] = False
+        section["error"] = "Não foi possível ler o export deste facial. Confira se ele está ligado."
+        return section
+    by_registration = {u.user_id: u for u in users if u.user_id}
+    known: set[str] = set()
+    for member in members:
+        chosen = selected_pools(member.pool) or registration_pools()
+        if pool["id"] not in {item["id"] for item in chosen}:
             continue
-        by_registration = {u.user_id: u for u in users if u.user_id}
-        known: set[str] = set()
-        for member in members:
-            chosen = selected_pools(member.pool) or registration_pools()
-            if pool["id"] not in {item["id"] for item in chosen}:
-                continue
-            known.add(member.registration)
-            if member.id not in photos:
-                photos[member.id] = _read_photo(member)
-                thumbs[member.id] = _thumb(photos[member.id])
-            row = _member_check(member, by_registration.get(member.registration), users, photos[member.id])
-            row["our_photo"] = thumbs[member.id]
-            section["rows"].append(row)
-        # Sócio de outra piscina que ficou neste facial também é um usuário sobrando aqui.
-        for user in users:
-            if user.user_id in known:
-                continue
-            others = [
-                other.name or other.user_id
-                for other in users
-                if user.face_id and other.face_id == user.face_id and other.user_id != user.user_id
-            ]
-            section["orphans"].append(
-                {
-                    "registration": user.user_id,
-                    "name": user.name,
-                    "face_id": user.face_id or None,
-                    "shared_with": others,
-                    "device_photo": _thumb(user.photo),
-                }
-            )
-        order = {"erro": 0, "aviso": 1, "ok": 2}
-        section["rows"].sort(key=lambda row: (order[row["status"]], row["name"].casefold()))
-        section["counts"] = {
-            key: sum(1 for row in section["rows"] if row["status"] == key) for key in order
-        }
+        known.add(member.registration)
+        row = _member_check(
+            member, by_registration.get(member.registration), users, photos[member.id], thumbnails
+        )
+        row["our_photo"] = thumbs.get(member.id)
+        section["rows"].append(row)
+    # Sócio de outra piscina que ficou neste facial também é um usuário sobrando aqui.
+    for user in users:
+        if user.user_id in known:
+            continue
+        others = [
+            other.name or other.user_id
+            for other in users
+            if user.face_id and other.face_id == user.face_id and other.user_id != user.user_id
+        ]
+        section["orphans"].append(
+            {
+                "registration": user.user_id,
+                "name": user.name,
+                "face_id": user.face_id or None,
+                "shared_with": others,
+                "device_photo": _thumb(user.photo) if thumbnails else None,
+            }
+        )
+    order = {"erro": 0, "aviso": 1, "ok": 2}
+    section["rows"].sort(key=lambda row: (order[row["status"]], row["name"].casefold()))
+    section["counts"] = {key: sum(1 for row in section["rows"] if row["status"] == key) for key in order}
+    return section
+
+
+def run_audit(*, thumbnails: bool = True) -> dict[str, Any]:
+    """Uma seção por facial: cada sócio que deveria estar nele e os usuários sem cadastro.
+
+    Os faciais são lidos ao mesmo tempo: o export de cada um demora alguns segundos.
+    """
+    members = db.list_members()
+    photos = {member.id: _read_photo(member) for member in members}
+    thumbs = {member_id: _thumb(data) for member_id, data in photos.items()} if thumbnails else {}
+    pools = registration_pools()
+    with ThreadPoolExecutor(max_workers=max(1, len(pools))) as executor:
+        devices = list(executor.map(lambda pool: _audit_device(pool, members, photos, thumbs, thumbnails), pools))
     return {"ok": True, "devices": devices}

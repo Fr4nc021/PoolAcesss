@@ -688,6 +688,58 @@ def adm_conferir_fotos():
     return jsonify(run_audit())
 
 
+@bp.post("/adm/corrigir-fotos")
+def adm_corrigir_fotos():
+    """Corrige em segundo plano tudo que a conferência acha e tem uma resposta certa."""
+    from app import face_fix
+
+    ok, message = face_fix.start()
+    return jsonify({"ok": ok, "message": message, "error": None if ok else message}), (202 if ok else 409)
+
+
+@bp.get("/adm/corrigir-fotos")
+def adm_corrigir_fotos_status():
+    from app import face_fix
+
+    return jsonify({"ok": True, **face_fix.status()})
+
+
+def _member_ready_for_facial(member: Optional[db.Member]):
+    """Resposta de erro se o sócio não pode receber o rosto agora; None se pode."""
+    if member is None:
+        return jsonify({"ok": False, "error": "Membro não encontrado."}), 404
+    if member.access_blocked or member.is_expired:
+        return jsonify({"ok": False, "error": f"O exame de {member.name} está vencido: renove antes."}), 400
+    problem = lan_ip_problem()
+    if problem:
+        return jsonify({"ok": False, "error": problem}), 400
+    return None
+
+
+def _recreate(member: db.Member, photo: Path, detail: str) -> tuple[list[str], Optional[str]]:
+    """Recria o sócio nos faciais da piscina dele e registra o evento se algum deu certo."""
+    from app.face_fix import recreate_member
+
+    done, error = recreate_member(member, photo)
+    if done:
+        db.log_access_event(
+            result="photo_updated",
+            member_name=member.name,
+            registration=member.registration,
+            detail=detail,
+        )
+    return done, error
+
+
+def _recreate_json(member: db.Member, done: list[str], error: Optional[str]):
+    if done:
+        request_sync()
+    if error:
+        feito = f" Já refeito em: {', '.join(done)}." if done else ""
+        return jsonify({"ok": False, "error": f"{error}{feito}"}), 502
+    return jsonify({"ok": True, "message": f"{member.name} refeito em: {', '.join(done)}."})
+
+
 @bp.post("/adm/membros/<int:member_id>/refazer-facial")
 @_blocks_update
 def adm_refazer_facial(member_id: int):
@@ -696,54 +748,62 @@ def adm_refazer_facial(member_id: int):
     Recriado, o usuário ganha um FaceID novo: desfaz o rosto preso no FaceID de outro.
     """
     member = db.get_member(member_id)
-    if member is None:
-        return jsonify({"ok": False, "error": "Membro não encontrado."}), 404
-    if member.access_blocked or member.is_expired:
-        return jsonify({"ok": False, "error": f"O exame de {member.name} está vencido: renove antes."}), 400
+    refused = _member_ready_for_facial(member)
+    if refused:
+        return refused
     photo = Path(member.photo_path) if member.photo_path else None
     if photo is None or not photo.is_file():
         return jsonify({
             "ok": False,
             "error": f"A foto de {member.name} não está neste PC. Use o botão Foto na aba Sócios.",
         }), 400
-    problem = lan_ip_problem()
-    if problem:
-        return jsonify({"ok": False, "error": problem}), 400
     try:
         photo = face_photo(photo)
     except DeviceError as exc:
         return jsonify({"ok": False, "error": f"A foto salva não abriu: {exc}"}), 400
-    face_url = public_media_url(photo.name)
+    done, error = _recreate(member, photo, "Refeito no facial com a foto do sistema")
+    return _recreate_json(member, done, error)
 
-    done: list[str] = []
-    first_id: Optional[int] = None
-    for url, label in _pool_urls(member.pool).items():
-        client = IntelbrasClient(base_url=url)
-        try:
-            client.delete_user(registration=member.registration)
-            created = client.create_user_with_face(
-                member.name,
-                photo,
-                registration=member.registration,
-                face_public_url=face_url,
-            )
-        except DeviceError as exc:
-            logger.exception("Falha ao refazer %s em %s", member.registration, url)
-            feito = f" Já refeito em: {', '.join(done)}." if done else ""
-            return jsonify({"ok": False, "error": f"{label}: {exc}{feito}"}), 502
-        done.append(label)
-        if first_id is None:
-            first_id = created.device_user_id
-    if first_id is not None:
-        db.update_device_user_id(member_id, first_id)
-    db.log_access_event(
-        result="photo_updated",
-        member_name=member.name,
-        registration=member.registration,
-        detail="Refeito no facial pela conferência de fotos",
-    )
-    request_sync()
-    return jsonify({"ok": True, "message": f"{member.name} refeito em: {', '.join(done)}."})
+
+@bp.post("/adm/membros/<int:member_id>/usar-foto-intelbras")
+@_blocks_update
+def adm_usar_foto_intelbras(member_id: int):
+    """Usa a foto que um facial guardou como foto do sócio e recria ele com ela.
+
+    A foto é lida antes de apagar qualquer coisa. Ela passa a ser a foto do
+    sistema também, para os dois PCs e a nuvem.
+    """
+    member = db.get_member(member_id)
+    refused = _member_ready_for_facial(member)
+    if refused:
+        return refused
+    url = str((request.get_json(silent=True) or {}).get("url") or "")
+    if url not in {pool["url"] for pool in registration_pools()}:
+        return jsonify({"ok": False, "error": "Facial desconhecido."}), 400
+    users = IntelbrasClient(base_url=url).export_users(with_photos=True)
+    if users is None:
+        return jsonify({"ok": False, "error": "Não foi possível ler a foto do facial. Confira se ele está ligado."}), 502
+    user = next((u for u in users if u.user_id == member.registration), None)
+    if user is None or not user.photo:
+        return jsonify({"ok": False, "error": f"O facial não tem foto guardada para {member.name}."}), 400
+
+    ensure_directories()
+    stem = secure_filename(member.name)[:40] or "membro"
+    raw_path = PHOTOS_DIR / f"{stem}_{uuid.uuid4().hex[:8]}.jpg"
+    raw_path.write_bytes(user.photo)
+    try:
+        photo = prepare_face_photo(raw_path)
+    except DeviceError as exc:
+        raw_path.unlink(missing_ok=True)
+        return jsonify({"ok": False, "error": f"A foto do facial não abriu: {exc}"}), 400
+
+    done, error = _recreate(member, photo, "Foto do Intelbras passou a ser a foto do sistema")
+    if done:
+        # A foto antiga não é apagada do PC.
+        db.update_member_photo(member_id, str(photo))
+    else:
+        photo.unlink(missing_ok=True)
+    return _recreate_json(member, done, error)
 
 
 @bp.post("/adm/membros/<int:member_id>/piscinas")
