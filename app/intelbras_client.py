@@ -59,6 +59,23 @@ class DeviceError(Exception):
     """Erro de comunicação ou resposta do equipamento facial."""
 
 
+class FaceIDConflict(DeviceError):
+    """O rosto do sócio ficou no mesmo FaceID de outro usuário do facial.
+
+    O facial reconhece pelo FaceID: com dois usuários nele, o rosto de um
+    libera a entrada no nome do outro.
+    """
+
+
+@dataclass
+class ExportUser:
+    user_id: str
+    name: str
+    face_id: str
+    has_model: bool
+    photo: Optional[bytes]
+
+
 @dataclass
 class CreatedUser:
     device_user_id: int
@@ -151,6 +168,72 @@ class IntelbrasClient:
             response = client.get(self._url("/api/user/export"))
             response.raise_for_status()
             return response.content
+
+    def export_users(self, *, with_photos: bool = False) -> Optional[list[ExportUser]]:
+        """Usuários do export com FaceID, se têm modelo do rosto e a foto guardada.
+
+        O export traz todos os usuários de uma vez, sem paginação, então é a
+        fonte confiável para saber quais FaceIDs já estão em uso. A foto do
+        FaceID fica em faceIDs/RegFaceMeun/<FaceID>.jpg. None = export indisponível.
+        """
+        try:
+            raw = self._export_archive()
+            with tarfile.open(fileobj=BytesIO(raw), mode="r:gz") as archive:
+                xml_member = archive.extractfile("faceIDs/userdata.xml")
+                if xml_member is None:
+                    return None
+                root = ET.fromstring(xml_member.read())
+                model_ids: set[str] = set()
+                photos: dict[str, bytes] = {}
+                for item in archive.getmembers():
+                    if not (item.isfile() and item.size > 0):
+                        continue
+                    parts = item.name.split("/")
+                    if len(parts) >= 3 and parts[0] == "faceIDs" and "-" in parts[1]:
+                        model_ids.add(parts[1].split("-", 1)[0])
+                    elif with_photos and item.name.startswith("faceIDs/RegFaceMeun/"):
+                        fileobj = archive.extractfile(item)
+                        if fileobj is not None:
+                            photos[Path(item.name).stem] = fileobj.read()
+        except (httpx.HTTPError, tarfile.TarError, ET.ParseError, OSError, EOFError) as exc:
+            logger.warning("Não foi possível ler o export do facial %s: %s", self.base_url, exc)
+            return None
+        users: list[ExportUser] = []
+        for key in root.findall("Key"):
+            face_id = _clean_face_id(key.get("FaceID"))
+            users.append(
+                ExportUser(
+                    user_id=str(key.get("UserID") or ""),
+                    name=str(key.get("Name") or ""),
+                    face_id=face_id,
+                    has_model=bool(face_id) and face_id in model_ids,
+                    photo=photos.get(face_id) if face_id else None,
+                )
+            )
+        return users
+
+    def face_shared_with(self, registration: str) -> list[str]:
+        """Nomes dos outros usuários deste facial que estão no mesmo FaceID da matrícula."""
+        users = self.export_users()
+        if users is None:
+            users = [
+                ExportUser(
+                    user_id=str(user.get("UserID") or ""),
+                    name=str(user.get("Name") or ""),
+                    face_id=_clean_face_id(user.get("FaceID")),
+                    has_model=False,
+                    photo=None,
+                )
+                for user in self.list_users()
+            ]
+        face_id = next((u.face_id for u in users if u.user_id == str(registration)), "")
+        if not face_id:
+            return []
+        return [
+            u.name or u.user_id
+            for u in users
+            if u.face_id == face_id and u.user_id != str(registration)
+        ]
 
     def _face_signature(self, registration: str) -> FaceSignature:
         """Modelo do rosto que o facial gerou para a matrícula.
@@ -336,13 +419,20 @@ class IntelbrasClient:
             )
 
         device_id = int(user["ID"])
-        face_ok = self._send_face(
-            registration=reg,
-            name=name,
-            jpeg_path=jpeg_path,
-            device_user_id=device_id,
-            face_public_url=face_public_url,
-        )
+        try:
+            face_ok = self._send_face(
+                registration=reg,
+                name=name,
+                jpeg_path=jpeg_path,
+                device_user_id=device_id,
+                face_public_url=face_public_url,
+            )
+        except FaceIDConflict:
+            try:
+                self.delete_user(registration=reg)
+            except DeviceError as exc:
+                logger.warning("Rollback do usuário %s falhou: %s", reg, exc)
+            raise
 
         try:
             self._grant_always_access(
@@ -403,6 +493,22 @@ class IntelbrasClient:
                     )
                     continue
                 if self._face_confirmed(registration, previous=previous):
+                    others = self.face_shared_with(registration)
+                    if others:
+                        # Outro método não muda o FaceID do usuário: para aqui.
+                        logger.error(
+                            "Face de %s (reg=%s) ficou no FaceID de %s em %s",
+                            name,
+                            registration,
+                            ", ".join(others),
+                            self.base_url,
+                        )
+                        raise FaceIDConflict(
+                            f"O facial {self.base_url} gravou o rosto de {name} no mesmo número "
+                            f"de rosto (FaceID) de {', '.join(others)}. Nesse estado o rosto de um "
+                            "libera a entrada no nome do outro. Use o botão Foto em cada um para "
+                            "refazer, ou confira em ADM > Conferir fotos no Intelbras."
+                        )
                     logger.info(
                         "Face confirmada via %s na rodada %s (reg=%s)",
                         label,
@@ -437,28 +543,23 @@ class IntelbrasClient:
         )
 
     def _next_face_id(self) -> int:
+        """FaceID que ninguém usa neste facial.
+
+        Só a lista da API pode vir cortada pela paginação, e um FaceID de outro
+        sócio fazia o rosto novo liberar no nome dele. Sem o export, que traz
+        todos, este método de envio não é usado.
+        """
+        exported = self.export_users()
+        if exported is None:
+            raise DeviceError("Sem o export do facial não dá para escolher um FaceID livre.")
+        used = {u.face_id for u in exported if u.face_id}
+        used.update(_clean_face_id(user.get("FaceID")) for user in self.list_users())
         max_face = 0
-        for user in self.list_users():
+        for face_id in used:
             try:
-                max_face = max(max_face, int(user.get("FaceID") or 0))
+                max_face = max(max_face, int(face_id))
             except (TypeError, ValueError):
                 pass
-        try:
-            with self._client() as client:
-                exported = client.get(self._url("/api/user/export"))
-                exported.raise_for_status()
-                raw = exported.content
-            with tarfile.open(fileobj=BytesIO(raw), mode="r:gz") as src:
-                xml_member = src.extractfile("faceIDs/userdata.xml")
-                if xml_member is not None:
-                    root = ET.fromstring(xml_member.read())
-                    for key in root.findall("Key"):
-                        try:
-                            max_face = max(max_face, int(key.get("FaceID") or 0))
-                        except (TypeError, ValueError):
-                            pass
-        except Exception as exc:  # noqa: BLE001
-            logger.debug("Não foi possível ler FaceID do export: %s", exc)
         return max_face + 1
 
     def _put_register_img(self, face_id: int, jpeg_bytes: bytes) -> str:
@@ -720,6 +821,21 @@ class IntelbrasClient:
             logger.warning("Não foi possível ler logs do XPE: %s", last_error)
         return []
 
+    def _drop_shared_face(self, registration: str, name: str) -> None:
+        """Apaga do facial o usuário que divide o FaceID com outro, para recriar do zero.
+
+        Reenviar a foto no mesmo usuário mantém o FaceID repetido e troca o
+        rosto do outro sócio junto. Recriado, o usuário recebe um FaceID novo.
+        """
+        logger.warning(
+            "%s (reg=%s) divide o FaceID com outro usuário em %s: recriando",
+            name,
+            registration,
+            self.base_url,
+        )
+        self.delete_user(registration=registration)
+        return None
+
     def update_member_face(
         self,
         *,
@@ -731,6 +847,8 @@ class IntelbrasClient:
         """Atualiza a foto facial de um membro já cadastrado (ou recria se sumiu)."""
         jpeg_path = _ensure_jpeg_file(image_path)
         existing = self.find_user_by_registration(registration)
+        if existing and self.face_shared_with(registration):
+            existing = self._drop_shared_face(registration, name)
         if existing:
             device_id = int(existing["ID"])
             face_ok = self._send_face(
@@ -794,6 +912,13 @@ class IntelbrasClient:
     ) -> CreatedUser:
         self.ping()
         existing = self.find_user_by_registration(registration)
+        if existing and self.face_shared_with(registration):
+            if not image_path or not Path(image_path).exists():
+                raise DeviceError(
+                    f"{name} está no mesmo número de rosto (FaceID) de outro usuário no facial "
+                    f"{self.base_url}, e a foto salva não está neste PC. Envie uma foto nova pelo botão Foto."
+                )
+            existing = self._drop_shared_face(registration, name)
         if existing:
             device_id = int(existing["ID"])
             face_ok = True
@@ -1089,6 +1214,12 @@ def _int_or_none(value: object) -> Optional[int]:
         return int(value)  # type: ignore[arg-type]
     except (TypeError, ValueError):
         return None
+
+
+def _clean_face_id(value: object) -> str:
+    """FaceID como texto; vazio quando o usuário não tem rosto ("0")."""
+    face_id = str(value or "").strip()
+    return "" if face_id == "0" else face_id
 
 
 def _face_assigned(user: dict[str, Any]) -> bool:

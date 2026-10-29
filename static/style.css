@@ -1022,3 +1022,52 @@ body {
 .hint.is-bad {
   color: var(--err);
 }
+
+.face-audit h3 {
+  margin: 0.8rem 0 0.2rem;
+  font-size: 1.05rem;
+}
+
+.face-audit h4 {
+  margin: 0.8rem 0 0.3rem;
+  font-size: 0.95rem;
+}
+
+.face-audit .filter-group[hidden] {
+  display: none;
+}
+
+.audit-photo img,
+.audit-orphans img {
+  width: 64px;
+  height: 85px;
+  object-fit: cover;
+  border-radius: 8px;
+  border: 1px solid var(--line);
+  background: #fff;
+}
+
+.audit-msg {
+  margin-top: 0.3rem;
+  font-size: 0.85rem;
+  line-height: 1.35;
+}
+
+.audit-orphans {
+  display: grid;
+  gap: 0.4rem;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.audit-orphans li {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+}
+
+.audit-orphans img {
+  width: 40px;
+  height: 53px;
+}
