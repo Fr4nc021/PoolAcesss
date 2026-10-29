@@ -80,6 +80,18 @@
       Excluir remove a face dos equipamentos e apaga o cadastro neste sistema.
     </p>
 
+    <div class="panel-actions">
+      <button type="button" class="btn btn-secondary" id="btn-face-audit">Conferir fotos no Intelbras</button>
+    </div>
+    <div id="face-audit" class="sync-test face-audit" hidden aria-live="polite">
+      <p id="face-audit-status"></p>
+      <div class="filter-group" role="group" aria-label="Filtro da conferência" id="face-audit-filters" hidden>
+        <button type="button" class="filter-btn is-active" data-audit-filter="problemas">Só com problema</button>
+        <button type="button" class="filter-btn" data-audit-filter="todos">Todos</button>
+      </div>
+      <div id="face-audit-result"></div>
+    </div>
+
     {% if all_members %}
     <div class="toolbar">
       <label class="search-field">
@@ -842,6 +854,158 @@
         out.value = "Falha no teste: " + (err.message || err);
       }
       validityButton.disabled = false;
+    });
+  }
+
+  const auditButton = document.getElementById("btn-face-audit");
+  if (auditButton) {
+    const auditBox = document.getElementById("face-audit");
+    const auditStatus = document.getElementById("face-audit-status");
+    const auditResult = document.getElementById("face-audit-result");
+    const auditFilters = document.getElementById("face-audit-filters");
+    let auditFilter = "problemas";
+
+    const el = (tag, className, text) => {
+      const node = document.createElement(tag);
+      if (className) node.className = className;
+      if (text !== undefined && text !== null) node.textContent = text;
+      return node;
+    };
+    const photoCell = (src, label) => {
+      const cell = el("td", "audit-photo");
+      if (src) {
+        const img = el("img");
+        img.src = src;
+        img.alt = label;
+        cell.appendChild(img);
+      } else {
+        cell.appendChild(el("span", "empty", "sem foto"));
+      }
+      return cell;
+    };
+    const badge = { erro: ["status-expired", "Problema"], aviso: ["status-warning", "Conferir"], ok: ["status-ok", "OK"] };
+
+    async function redo(row, button) {
+      if (!window.confirm(
+        `Apagar ${row.name} dos faciais da piscina e cadastrar de novo com a foto salva no sistema?`
+      )) return;
+      button.disabled = true;
+      button.textContent = "Refazendo...";
+      try {
+        const response = await fetch(`/adm/membros/${row.member_id}/refazer-facial`, {
+          method: "POST",
+          headers: { Accept: "application/json" },
+        });
+        const data = await response.json();
+        if (!response.ok || !data.ok) throw new Error(data.error || "Falha ao refazer.");
+        button.textContent = "Refeito — confira de novo";
+      } catch (err) {
+        button.disabled = false;
+        button.textContent = "Refazer no facial";
+        window.alert(err.message || String(err));
+      }
+    }
+
+    function render(data) {
+      auditResult.replaceChildren();
+      for (const device of data.devices || []) {
+        const section = el("section", "audit-device");
+        section.appendChild(el("h3", null, `${device.label} — ${device.url}`));
+        if (!device.ok) {
+          section.appendChild(el("p", "is-bad", device.error));
+          auditResult.appendChild(section);
+          continue;
+        }
+        const c = device.counts;
+        section.appendChild(el("p", null, `${c.erro} com problema, ${c.aviso} para conferir, ${c.ok} OK.`));
+        const rows = device.rows.filter((row) => auditFilter === "todos" || row.status !== "ok");
+        if (rows.length) {
+          const wrap = el("div", "table-wrap");
+          const table = el("table", "members-table audit-table");
+          const head = el("tr");
+          ["Sócio", "Foto no sistema", "Foto no Intelbras", "Situação", ""].forEach((t) => head.appendChild(el("th", null, t)));
+          table.appendChild(el("thead")).appendChild(head);
+          const body = el("tbody");
+          for (const row of rows) {
+            const tr = el("tr");
+            const who = el("td");
+            who.appendChild(el("strong", null, row.name));
+            who.appendChild(el("div", "mono", `${row.registration}${row.face_id ? " · FaceID " + row.face_id : ""}`));
+            tr.appendChild(who);
+            tr.appendChild(photoCell(row.our_photo, "Foto no sistema"));
+            tr.appendChild(photoCell(row.device_photo, "Foto no Intelbras"));
+            const state = el("td");
+            const [cls, text] = badge[row.status];
+            state.appendChild(el("span", `badge ${cls}`, text));
+            for (const msg of [...row.problems, ...row.warnings]) state.appendChild(el("div", "audit-msg", msg));
+            tr.appendChild(state);
+            const action = el("td", "actions");
+            if (row.status !== "ok" && !row.blocked) {
+              const button = el("button", "btn btn-secondary", "Refazer no facial");
+              button.type = "button";
+              button.addEventListener("click", () => redo(row, button));
+              action.appendChild(button);
+            }
+            tr.appendChild(action);
+            body.appendChild(tr);
+          }
+          table.appendChild(body);
+          wrap.appendChild(table);
+          section.appendChild(wrap);
+        } else {
+          section.appendChild(el("p", "empty", "Nenhum sócio com problema neste facial."));
+        }
+        if (device.orphans.length) {
+          section.appendChild(el("h4", null, `No facial, mas sem cadastro desta piscina no sistema (${device.orphans.length})`));
+          const list = el("ul", "audit-orphans");
+          for (const user of device.orphans) {
+            const item = el("li");
+            if (user.device_photo) {
+              const img = el("img");
+              img.src = user.device_photo;
+              img.alt = user.name;
+              item.appendChild(img);
+            }
+            let text = `${user.name || "(sem nome)"} — ${user.registration}`;
+            if (user.shared_with.length) text += ` · mesmo FaceID de ${user.shared_with.join(", ")}`;
+            item.appendChild(el("span", null, text));
+            list.appendChild(item);
+          }
+          section.appendChild(list);
+        }
+        auditResult.appendChild(section);
+      }
+    }
+
+    let lastAudit = null;
+    auditFilters.querySelectorAll("[data-audit-filter]").forEach((button) => {
+      button.addEventListener("click", () => {
+        auditFilter = button.dataset.auditFilter;
+        auditFilters.querySelectorAll("[data-audit-filter]").forEach((b) => b.classList.toggle("is-active", b === button));
+        if (lastAudit) render(lastAudit);
+      });
+    });
+
+    auditButton.addEventListener("click", async () => {
+      auditButton.disabled = true;
+      auditBox.hidden = false;
+      auditStatus.textContent = "Lendo os faciais e comparando sócio a sócio... pode levar alguns segundos.";
+      auditResult.replaceChildren();
+      try {
+        const response = await fetch("/adm/conferir-fotos", {
+          method: "POST",
+          headers: { Accept: "application/json" },
+        });
+        const data = await response.json();
+        if (!response.ok || !data.ok) throw new Error(data.error || "Falha na conferência.");
+        lastAudit = data;
+        auditStatus.textContent = `Conferido em ${new Date().toLocaleTimeString("pt-BR")}. "Refazer no facial" apaga o sócio do facial e cadastra de novo com a foto do sistema.`;
+        auditFilters.hidden = false;
+        render(data);
+      } catch (err) {
+        auditStatus.textContent = "Falha na conferência: " + (err.message || err);
+      }
+      auditButton.disabled = false;
     });
   }
 

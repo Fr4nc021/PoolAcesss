@@ -680,6 +680,72 @@ def _pool_urls(pool: Optional[str]) -> dict[str, str]:
     return {item["url"]: item["label"] for item in chosen}
 
 
+@bp.post("/adm/conferir-fotos")
+def adm_conferir_fotos():
+    """Passa sócio a sócio comparando o banco deste PC com o que cada facial guardou."""
+    from app.face_audit import run_audit
+
+    return jsonify(run_audit())
+
+
+@bp.post("/adm/membros/<int:member_id>/refazer-facial")
+@_blocks_update
+def adm_refazer_facial(member_id: int):
+    """Apaga o sócio dos faciais da piscina dele e cadastra de novo com a foto salva.
+
+    Recriado, o usuário ganha um FaceID novo: desfaz o rosto preso no FaceID de outro.
+    """
+    member = db.get_member(member_id)
+    if member is None:
+        return jsonify({"ok": False, "error": "Membro não encontrado."}), 404
+    if member.access_blocked or member.is_expired:
+        return jsonify({"ok": False, "error": f"O exame de {member.name} está vencido: renove antes."}), 400
+    photo = Path(member.photo_path) if member.photo_path else None
+    if photo is None or not photo.is_file():
+        return jsonify({
+            "ok": False,
+            "error": f"A foto de {member.name} não está neste PC. Use o botão Foto na aba Sócios.",
+        }), 400
+    problem = lan_ip_problem()
+    if problem:
+        return jsonify({"ok": False, "error": problem}), 400
+    try:
+        photo = face_photo(photo)
+    except DeviceError as exc:
+        return jsonify({"ok": False, "error": f"A foto salva não abriu: {exc}"}), 400
+    face_url = public_media_url(photo.name)
+
+    done: list[str] = []
+    first_id: Optional[int] = None
+    for url, label in _pool_urls(member.pool).items():
+        client = IntelbrasClient(base_url=url)
+        try:
+            client.delete_user(registration=member.registration)
+            created = client.create_user_with_face(
+                member.name,
+                photo,
+                registration=member.registration,
+                face_public_url=face_url,
+            )
+        except DeviceError as exc:
+            logger.exception("Falha ao refazer %s em %s", member.registration, url)
+            feito = f" Já refeito em: {', '.join(done)}." if done else ""
+            return jsonify({"ok": False, "error": f"{label}: {exc}{feito}"}), 502
+        done.append(label)
+        if first_id is None:
+            first_id = created.device_user_id
+    if first_id is not None:
+        db.update_device_user_id(member_id, first_id)
+    db.log_access_event(
+        result="photo_updated",
+        member_name=member.name,
+        registration=member.registration,
+        detail="Refeito no facial pela conferência de fotos",
+    )
+    request_sync()
+    return jsonify({"ok": True, "message": f"{member.name} refeito em: {', '.join(done)}."})
+
+
 @bp.post("/adm/membros/<int:member_id>/piscinas")
 @_blocks_update
 def adm_piscinas(member_id: int):
