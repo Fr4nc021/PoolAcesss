@@ -34,7 +34,7 @@ _SINGLE_RESULT = (
 
 
 class PanelUnavailable(Exception):
-    """Este facial não tem o /fcgi do painel: o cadastro segue pela API."""
+    """Este facial não tem o /fcgi do painel."""
 
 
 class PanelError(Exception):
@@ -53,6 +53,14 @@ def _encrypted_password(text: str) -> str:
     return ""
 
 
+def _answer(text: str, password: str) -> str:
+    """Começo da resposta do facial, sem a senha, para o erro mostrar o que ele disse."""
+    clean = re.sub(r"\s+", " ", text or "").strip()
+    if password:
+        clean = clean.replace(password, "***")
+    return clean[:300]
+
+
 def login(http: httpx.Client, base_url: str, user: str, password: str) -> None:
     """Abre a sessão do painel no http (cookies), como o login da tela do Intelbras."""
     response = http.get(
@@ -65,8 +73,13 @@ def login(http: httpx.Client, base_url: str, user: str, password: str) -> None:
     encrypted = _encrypted_password(response.text)
     if not encrypted or encrypted == "-1":
         if "hcSingleResult" not in response.text:
-            raise PanelUnavailable(f"{base_url} não respondeu como o painel do Intelbras")
-        raise PanelError("O facial recusou o usuário ou a senha (login do painel).")
+            raise PanelUnavailable(
+                f"{base_url} não respondeu como o painel do Intelbras. Resposta: {_answer(response.text, password)}"
+            )
+        raise PanelError(
+            "O facial recusou o usuário ou a senha (login do painel). "
+            f"Resposta: {_answer(response.text, password)}"
+        )
     # Sem domínio, o cookie vai para este facial seja ele IP ou nome; o http é só desta sessão.
     http.cookies.set("UserName", user)
     http.cookies.set("Password", encrypted)
@@ -76,7 +89,9 @@ def login(http: httpx.Client, base_url: str, user: str, password: str) -> None:
     )
     response.raise_for_status()
     if 'id="hcLoginStatus"' in response.text and 'value="-1"' in response.text:
-        raise PanelError("O facial recusou a sessão do painel (CreateSession).")
+        raise PanelError(
+            f"O facial recusou a sessão do painel (CreateSession). Resposta: {_answer(response.text, password)}"
+        )
 
 
 def add_user_with_face(

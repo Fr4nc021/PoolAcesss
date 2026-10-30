@@ -187,40 +187,10 @@ class IntelbrasClient:
         """
         try:
             raw = self._export_archive()
-            with tarfile.open(fileobj=BytesIO(raw), mode="r:gz") as archive:
-                xml_member = archive.extractfile("faceIDs/userdata.xml")
-                if xml_member is None:
-                    return None
-                root = ET.fromstring(xml_member.read())
-                model_ids: set[str] = set()
-                photos: dict[str, bytes] = {}
-                for item in archive.getmembers():
-                    if not (item.isfile() and item.size > 0):
-                        continue
-                    parts = item.name.split("/")
-                    if len(parts) >= 3 and parts[0] == "faceIDs" and "-" in parts[1]:
-                        model_ids.add(parts[1].split("-", 1)[0])
-                    elif with_photos and item.name.startswith("faceIDs/RegFaceMeun/"):
-                        fileobj = archive.extractfile(item)
-                        if fileobj is not None:
-                            photos[_photo_face_id(Path(item.name).stem)] = fileobj.read()
-        except (httpx.HTTPError, tarfile.TarError, ET.ParseError, OSError, EOFError) as exc:
+        except httpx.HTTPError as exc:
             logger.warning("Não foi possível ler o export do facial %s: %s", self.base_url, exc)
             return None
-        users: list[ExportUser] = []
-        for key in root.findall("Key"):
-            face_id = _clean_face_id(key.get("FaceID"))
-            users.append(
-                ExportUser(
-                    user_id=str(key.get("UserID") or ""),
-                    name=str(key.get("Name") or ""),
-                    face_id=face_id,
-                    has_model=bool(face_id) and face_id in model_ids,
-                    photo=photos.get(face_id) if face_id else None,
-                    device_id=str(key.get("ID") or ""),
-                )
-            )
-        return users
+        return parse_export(raw, with_photos=with_photos, source=self.base_url)
 
     def face_shared_with(self, registration: str) -> list[str]:
         """Nomes dos outros usuários deste facial que estão no mesmo FaceID da matrícula."""
@@ -349,6 +319,20 @@ class IntelbrasClient:
             raise DeviceError(f"{self.base_url}: {exc}") from exc
         except httpx.HTTPError as exc:
             raise DeviceError(f"Falha ao cadastrar pelo painel do facial {self.base_url}: {exc}") from exc
+
+    def check_panel_login(self) -> None:
+        """Só faz o login do painel. DeviceError se o facial recusar: nada é mexido."""
+        try:
+            with self._panel_http() as http:
+                intelbras_fcgi.login(http, self.base_url, self.login_name, self.password)
+        except intelbras_fcgi.PanelUnavailable as exc:
+            raise DeviceError(
+                f"O facial {self.base_url} não respondeu como o painel do Intelbras (/fcgi): {exc}"
+            ) from exc
+        except intelbras_fcgi.PanelError as exc:
+            raise DeviceError(f"{self.base_url}: {exc}") from exc
+        except httpx.HTTPError as exc:
+            raise DeviceError(f"Falha no login do painel do facial {self.base_url}: {exc}") from exc
 
     def _wait_for_user(self, registration: str) -> dict[str, Any]:
         for attempt in range(FACE_CONFIRM_RETRIES):
@@ -882,6 +866,49 @@ def _int_or_none(value: object) -> Optional[int]:
         return int(value)  # type: ignore[arg-type]
     except (TypeError, ValueError):
         return None
+
+
+def parse_export(raw: bytes, *, with_photos: bool = False, source: str = "") -> Optional[list[ExportUser]]:
+    """Lê o tar.gz do user/export (do facial ou de uma cópia em data/backups)."""
+    try:
+        with tarfile.open(fileobj=BytesIO(raw), mode="r:gz") as archive:
+            try:
+                xml_member = archive.extractfile("faceIDs/userdata.xml")
+            except KeyError:
+                # Facial sem nenhum usuário: o export vem sem a lista.
+                return []
+            if xml_member is None:
+                return None
+            root = ET.fromstring(xml_member.read())
+            model_ids: set[str] = set()
+            photos: dict[str, bytes] = {}
+            for item in archive.getmembers():
+                if not (item.isfile() and item.size > 0):
+                    continue
+                parts = item.name.split("/")
+                if len(parts) >= 3 and parts[0] == "faceIDs" and "-" in parts[1]:
+                    model_ids.add(parts[1].split("-", 1)[0])
+                elif with_photos and item.name.startswith("faceIDs/RegFaceMeun/"):
+                    fileobj = archive.extractfile(item)
+                    if fileobj is not None:
+                        photos[_photo_face_id(Path(item.name).stem)] = fileobj.read()
+    except (tarfile.TarError, ET.ParseError, OSError, EOFError) as exc:
+        logger.warning("Não foi possível ler o export do facial %s: %s", source, exc)
+        return None
+    users: list[ExportUser] = []
+    for key in root.findall("Key"):
+        face_id = _clean_face_id(key.get("FaceID"))
+        users.append(
+            ExportUser(
+                user_id=str(key.get("UserID") or ""),
+                name=str(key.get("Name") or ""),
+                face_id=face_id,
+                has_model=bool(face_id) and face_id in model_ids,
+                photo=photos.get(face_id) if face_id else None,
+                device_id=str(key.get("ID") or ""),
+            )
+        )
+    return users
 
 
 def registration_fits_panel(registration: object) -> bool:

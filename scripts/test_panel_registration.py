@@ -7,7 +7,9 @@ do clube; os pedidos ficam em panel_adds.
 
 from __future__ import annotations
 
+import io
 import sys
+import tarfile
 import tempfile
 import threading
 from datetime import datetime, timedelta
@@ -125,6 +127,64 @@ def test_reset_completes_through_panel(tmp: Path) -> None:
     assert len(faces) == 4 and len(set(faces)) == 4, f"os quatro com números diferentes: {faces}"
 
 
+def _reset_env(tmp: Path, name: str, client: PanelClient, device: PhotoDevice) -> None:
+    config.DB_PATH = tmp / f"{name}.db"
+    db.DB_PATH = config.DB_PATH
+    db.init_db()
+    pools = [{"id": "normal", "label": "Piscina normal", "url": device.url}]
+    config.registration_pools = lambda: pools  # noqa: E731
+    reset.registration_pools = lambda: pools  # noqa: E731
+    reset.IntelbrasClient = lambda base_url, **_kw: client  # noqa: E731
+    reset.PHOTOS_DIR = tmp / f"{name}_fotos"
+    reset.DATA_DIR = tmp / f"{name}_dados"
+
+
+def _run_reset() -> dict:
+    ok, message = reset.start()
+    assert ok, message
+    for thread in threading.enumerate():
+        if thread.name == "facial-reset":
+            thread.join(timeout=60)
+    return reset.status()["devices"][0]
+
+
+def test_empty_device_export_reads_as_empty() -> None:
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w:gz") as archive:
+        info = tarfile.TarInfo("faceIDs/RegFaceMeun")
+        info.type = tarfile.DIRTYPE
+        archive.addfile(info)
+    assert ic.parse_export(buffer.getvalue()) == [], "facial vazio é lista vazia, não erro"
+
+
+def test_reset_with_wrong_panel_password_deletes_nothing(tmp: Path) -> None:
+    device = _device()
+    client = PanelClient(device)
+    _reset_env(tmp, "senha", client, device)
+    for index, name in enumerate(("Ana", "Bia")):
+        photo = ic.prepare_face_photo(_photo(tmp / f"s{index}.jpg", size=(480 + index * 20, 640)))
+        client.create_user_with_face(name, photo, registration=f"AP2000000{index}")
+        db.create_member(
+            name=name, registration=f"AP2000000{index}", device_user_id=None, photo_path=str(photo),
+            expires_at=datetime.now() + timedelta(days=5), pool="normal",
+        )
+    staff = ic.prepare_face_photo(_photo(tmp / "func.jpg", size=(530, 640)))
+    client.create_user_with_face("Jorge", staff, registration="F1")
+    before = sorted(u["UserID"] for u in device.users.values())
+    client.password = "errada"
+    state = _run_reset()
+    assert state.get("error") and "Nada foi apagado" in state["error"], state
+    assert sorted(u["UserID"] for u in device.users.values()) == before, "senha errada não apaga ninguém"
+
+    # Simula a tentativa que apagou tudo: o funcionário só existe na cópia.
+    client.password = PASSWORD
+    for reg in before:
+        device.users.pop(device._by_userid(reg)["ID"])
+    state = _run_reset()
+    assert state["phase"] == "pronto" and not state.get("error"), state
+    assert sorted(u["UserID"] for u in device.users.values()) == before, "funcionário volta pela cópia"
+
+
 def main() -> None:
     with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
         root = Path(tmp)
@@ -133,6 +193,8 @@ def main() -> None:
         test_long_registration_is_refused(root)
         test_photo_change_recreates_through_panel(root)
         test_reset_completes_through_panel(root)
+        test_empty_device_export_reads_as_empty()
+        test_reset_with_wrong_panel_password_deletes_nothing(root)
     print("panel registration ok")
 
 

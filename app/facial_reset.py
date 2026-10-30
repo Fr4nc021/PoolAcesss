@@ -11,7 +11,9 @@ Para cada facial, a normal primeiro (tem menos gente):
      usa a que está no facial; sem nenhuma, fica como está e não é apagado);
    - quem só existe no facial (funcionários), com a foto do próprio facial,
      menos os registros antigos de quem já é sócio no sistema;
-3. apaga esses usuários e quem venceu ou não é desta piscina;
+3. confere o login do painel e cadastra o primeiro; só se ele entrar apaga
+   os outros e quem venceu ou não é desta piscina (quem saiu numa tentativa
+   anterior volta pela cópia mais recente em data/backups);
 4. cadastra um por um. Se o facial repetir o número de rosto, refaz quem
    perdeu o rosto, para tudo e mostra quem ficou sem cadastro.
 """
@@ -22,7 +24,7 @@ import logging
 import threading
 import unicodedata
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Optional
 
@@ -34,9 +36,14 @@ from app.intelbras_client import (
     FaceIDConflict,
     IntelbrasClient,
     face_photo,
+    parse_export,
 )
 
 logger = logging.getLogger(__name__)
+
+# Cópia de até uma semana atrás traz de volta quem saiu do facial numa tentativa
+# que não terminou (funcionários só têm a foto lá).
+BACKUP_MAX_AGE = timedelta(days=7)
 
 # Usuários de teste dos botões da ADM: nunca voltam.
 TEST_REGISTRATIONS = {"APFIDTESTE", "APVALTESTE"}
@@ -106,6 +113,22 @@ def plan_device(pool: dict[str, str], users: list[ExportUser], members: list[db.
     return {"back": back, "remove": remove, "untouched": untouched}
 
 
+def _recent_backup_users(host: str, skip: Path) -> list[ExportUser]:
+    """Usuários da cópia mais nova deste facial que ainda tinha gente, se for recente."""
+    limit = datetime.now() - BACKUP_MAX_AGE
+    files = sorted((DATA_DIR / "backups").glob(f"facial_{host}_*.tgz"), reverse=True)
+    for path in files:
+        if path == skip or datetime.fromtimestamp(path.stat().st_mtime) < limit:
+            continue
+        try:
+            users = parse_export(path.read_bytes(), with_photos=True, source=str(path))
+        except OSError:
+            continue
+        if users:
+            return users
+    return []
+
+
 def _set(device: dict[str, Any], **values: Any) -> None:
     with _lock:
         device.update(values)
@@ -138,25 +161,45 @@ def _reset_device(pool: dict[str, str], device: dict[str, Any], members: list[db
     ensure_directories()
     backups = DATA_DIR / "backups"
     backups.mkdir(parents=True, exist_ok=True)
-    backup = backups / f"facial_{_host(pool['url'])}_{datetime.now():%Y%m%d_%H%M%S}.tgz"
+    stamp = f"facial_{_host(pool['url'])}_{datetime.now():%Y%m%d_%H%M%S}"
+    backup = backups / f"{stamp}.tgz"
+    copy = 1
+    while backup.exists():
+        # Nunca escreve por cima de uma cópia: ela pode ser a única com os funcionários.
+        copy += 1
+        backup = backups / f"{stamp}_{copy}.tgz"
     backup.write_bytes(client._export_archive())
     users = client.export_users(with_photos=True)
     if users is None:
         raise DeviceError("Não foi possível ler os usuários do facial. Nada foi apagado.")
-    plan = plan_device(pool, users, members)
+    # Antes de apagar qualquer um, confere que o cadastro pelo painel abre.
+    try:
+        client.check_panel_login()
+    except DeviceError as exc:
+        raise DeviceError(f"{exc} Nada foi apagado.") from exc
+    on_device = {u.user_id for u in users}
+    restored = [u for u in _recent_backup_users(_host(pool["url"]), backup) if u.user_id not in on_device]
+    plan = plan_device(pool, users + restored, members)
     _set(device, backup=str(backup), total=len(plan["back"]), untouched=plan["untouched"])
 
-    _set(device, phase="apagando")
-    on_device = {u.user_id for u in users}
-    for item in plan["back"] + plan["remove"]:
-        if item["registration"] in on_device:
-            client.delete_user(registration=item["registration"])
-    _set(device, removed=[item["name"] for item in plan["remove"]])
-
-    _set(device, phase="cadastrando")
     done: list[dict[str, Any]] = []
+
+    def stop(item: dict[str, Any], index: int, error: str, repaired: list[str]) -> bool:
+        missing = [item["name"]] + [rest["name"] for rest in plan["back"][index + 1:]]
+        _set(device, error=error, repaired=repaired, missing=missing, current=None)
+        return False
+
     for index, item in enumerate(plan["back"]):
-        _set(device, current=item["name"])
+        if index == 1:
+            # O primeiro entrou: só agora apaga os outros e quem sai.
+            _set(device, phase="apagando")
+            for other in plan["back"][1:] + plan["remove"]:
+                if other["registration"] in on_device:
+                    client.delete_user(registration=other["registration"])
+            _set(device, removed=[r["name"] for r in plan["remove"]])
+        _set(device, phase="cadastrando", current=item["name"])
+        if index == 0 and item["registration"] in on_device:
+            client.delete_user(registration=item["registration"])
         try:
             _register(client, item)
         except FaceIDConflict as exc:
@@ -170,17 +213,12 @@ def _reset_device(pool: dict[str, str], device: dict[str, Any], members: list[db
                     repaired.append(other["name"])
                 except DeviceError as again:
                     logger.error("Não deu para refazer %s: %s", other["registration"], again)
-            missing = [item["name"]] + [rest["name"] for rest in plan["back"][index + 1:]]
-            _set(
-                device,
-                error=str(exc),
-                repaired=repaired,
-                missing=missing,
-                current=None,
-            )
-            return False
+            return stop(item, index, str(exc), repaired)
         except (DeviceError, OSError) as exc:
             logger.error("Falha ao recadastrar %s em %s: %s", item["registration"], pool["url"], exc)
+            if index == 0:
+                # Nem o primeiro entrou: para antes de apagar os outros.
+                return stop(item, index, f"{exc} Os outros não foram apagados.", [])
             with _lock:
                 device.setdefault("failed", []).append({"name": item["name"], "erro": str(exc)})
         else:
@@ -193,6 +231,11 @@ def _reset_device(pool: dict[str, str], device: dict[str, Any], members: list[db
                     detail=f"Recadastrado do zero no facial ({pool['label']})",
                 )
         _set(device, done=index + 1)
+    if len(plan["back"]) <= 1:
+        for other in plan["remove"]:
+            if other["registration"] in on_device:
+                client.delete_user(registration=other["registration"])
+        _set(device, removed=[r["name"] for r in plan["remove"]])
     _set(device, current=None, phase="pronto")
     return True
 
