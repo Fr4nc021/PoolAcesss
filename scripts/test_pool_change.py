@@ -48,7 +48,6 @@ def _setup():
     routes.IntelbrasClient = FakeClient
     main.start_expiry_worker = lambda: None
     main.start_sync_worker = lambda: None
-    routes.public_media_url = lambda name: f"http://pc/media/{name}"
     app = main.create_app()
     client = app.test_client()
     client.environ_base["REMOTE_ADDR"] = "127.0.0.1"

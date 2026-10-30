@@ -34,9 +34,7 @@ from app.intelbras_client import (
     FaceIDConflict,
     IntelbrasClient,
     face_photo,
-    public_media_url,
 )
-from app.netcheck import lan_ip_problem
 
 logger = logging.getLogger(__name__)
 
@@ -114,7 +112,7 @@ def _set(device: dict[str, Any], **values: Any) -> None:
 
 
 def _register(client: IntelbrasClient, item: dict[str, Any]) -> None:
-    """Cadastra um usuário com a foto do sistema ou a guardada no facial, pela FaceUrl."""
+    """Cadastra um usuário pelo painel, com a foto do sistema ou a guardada no facial."""
     temp: Optional[Path] = None
     if "path" in item:
         photo = face_photo(item["path"])
@@ -124,12 +122,7 @@ def _register(client: IntelbrasClient, item: dict[str, Any]) -> None:
         temp.write_bytes(item["photo"])
         photo = face_photo(temp)
     try:
-        client.create_user_with_face(
-            item["name"],
-            photo,
-            registration=item["registration"],
-            face_public_url=public_media_url(photo.name),
-        )
+        client.create_user_with_face(item["name"], photo, registration=item["registration"])
     finally:
         if temp is not None:
             temp.unlink(missing_ok=True)
@@ -241,9 +234,6 @@ def status_devices() -> list[dict[str, Any]]:
 def start() -> tuple[bool, str]:
     from app import face_fix
 
-    problem = lan_ip_problem()
-    if problem:
-        return False, problem
     if face_fix.status().get("running"):
         return False, "Espere o \"Corrigir tudo\" terminar."
     with _lock:

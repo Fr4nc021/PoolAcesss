@@ -56,58 +56,12 @@ def test_chromeos_is_not_compared() -> None:
         netcheck.on_chromeos = lambda: False  # noqa: E731
 
 
-def test_registration_is_refused_before_saving_the_photo() -> None:
-    import app.db as db
-    import app.routes as routes
-    from app.main import create_app
-
-    os.environ["SERVER_LAN_IP"] = "192.168.15.4"
-    original = routes.lan_ip_problem
-    routes.lan_ip_problem = lambda: netcheck.lan_ip_problem(THIS_PC)  # noqa: E731
-    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
-        root = Path(tmp)
-        config.DATA_DIR = root
-        config.PHOTOS_DIR = root / "photos"
-        config.PHOTOS_DIR.mkdir()
-        routes.PHOTOS_DIR = config.PHOTOS_DIR
-        config.DB_PATH = root / "t.db"
-        db.DB_PATH = config.DB_PATH
-        os.environ["SYNC_PEER_URL"] = ""
-        os.environ["SUPABASE_URL"] = ""
-        try:
-            client = create_app().test_client()
-            response = client.post(
-                "/cadastrar",
-                data={
-                    "name": "Teste",
-                    "pool": "normal",
-                    "photo": (io.BytesIO(b"\xff\xd8\xff" + b"0" * 2000), "rosto.jpg"),
-                },
-                headers={"Accept": "application/json"},
-                content_type="multipart/form-data",
-            )
-            assert response.status_code == 500
-            assert "não é deste PC" in response.get_json()["error"]
-            assert not any(config.PHOTOS_DIR.iterdir()), "a foto não pode ficar salva"
-
-            page = client.get("/membros").get_data(as_text=True)
-            assert 'id="lan-ip-warning"' in page
-        finally:
-            routes.lan_ip_problem = original
-            from app.expiry import stop_expiry_worker
-            from app.sync import stop_sync_worker
-
-            stop_sync_worker()
-            stop_expiry_worker()
-
-
 def main() -> None:
     test_matching_ip_has_no_warning()
     test_ip_of_other_pc_is_reported_with_the_right_suggestion()
     test_empty_and_invalid_values()
     test_unknown_local_ips_do_not_block()
     test_chromeos_is_not_compared()
-    test_registration_is_refused_before_saving_the_photo()
     print("netcheck ok")
 
 

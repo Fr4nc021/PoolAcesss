@@ -92,16 +92,8 @@ def test_probe_with_real_photo(tmp: Path) -> None:
     device, _faces = _thermal(tmp)
     client = FakeClient(device)
     photo = ic.prepare_face_photo(_photo(tmp / "equipe.jpg", size=(540, 700))).read_bytes()
-
-    class Served(dict):
-        def get(self, key, default=None):  # o facial baixa a foto deste PC pela FaceUrl
-            return photo if key.startswith("http://pc/media/teste_faceid_") else default
-
     probe.PHOTOS_DIR = tmp
-    probe.public_media_url = lambda name: f"http://pc/media/{name}"  # noqa: E731
-    device.served_photos = Served()
     report = probe.run_probe(client, photo)
-    assert report["cadastro"]["foto_por_endereco"] is True
     assert not list(tmp.glob("teste_faceid_*")), "a foto de teste sai do PC"
     assert "erro" not in report and "erro" not in report["cadastro"], report
     assert report["cadastro"]["faceid_dado"] == "7" and report["cadastro"]["ja_era_de"] == []

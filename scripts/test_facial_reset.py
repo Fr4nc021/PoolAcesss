@@ -49,8 +49,6 @@ def _setup(tmp: Path, name: str, devices: list[PhotoDevice]) -> None:
     config.registration_pools = lambda: pools  # noqa: E731
     reset.registration_pools = lambda: pools  # noqa: E731
     reset.IntelbrasClient = lambda base_url, **_kw: clients[base_url]  # noqa: E731
-    reset.public_media_url = lambda _name: ""  # noqa: E731 — vai em base64 no facial de mentira
-    reset.lan_ip_problem = lambda: None  # noqa: E731
     reset.PHOTOS_DIR = tmp / f"{name}_fotos"
     reset.DATA_DIR = tmp / f"{name}_dados"
 

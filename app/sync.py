@@ -14,7 +14,7 @@ import httpx
 
 from app import db, exam_test
 from app.config import sync_settings
-from app.intelbras_client import DeviceError, fleet_for_pool, public_media_url
+from app.intelbras_client import DeviceError, fleet_for_pool
 
 logger = logging.getLogger(__name__)
 
@@ -824,14 +824,12 @@ def _apply_pending_unblocks() -> None:
         photo = Path(member.photo_path) if member.photo_path else None
         if photo is not None and not photo.is_file():
             photo = None
-        face_url = public_media_url(photo.name) if photo is not None else None
         try:
             created = fleet_for_pool(member.pool).renew_member(
                 name=member.name,
                 registration=member.registration,
                 image_path=photo,
                 previous_device_user_id=member.device_user_id,
-                face_public_url=face_url,
             )
         except DeviceError as exc:
             logger.error(

@@ -151,7 +151,7 @@ def _save_upload(photo, name_hint: str) -> Path:
     filename = f"{safe_stem}_{uuid.uuid4().hex[:8]}{ext}"
     photo_path = PHOTOS_DIR / filename
     photo.save(photo_path)
-    # A FaceUrl aponta para este arquivo: ele já precisa ser o JPEG final, não o PNG enviado.
+    # Este arquivo vai para o facial: ele já precisa ser o JPEG final, não o PNG enviado.
     try:
         return prepare_face_photo(photo_path)
     except DeviceError:
@@ -266,7 +266,7 @@ def index():
 
 @bp.get("/media/<path:filename>")
 def media(filename: str):
-    """Fotos servidas para o XPE baixar via FaceUrl."""
+    """Fotos dos sócios, para as telas do sistema."""
     ensure_directories()
     safe = Path(filename).name
     return send_from_directory(PHOTOS_DIR, safe)
@@ -339,29 +339,15 @@ def cadastrar():
     if not _allowed_file(photo.filename):
         return fail("Formato de foto inválido. Use JPG ou PNG.")
 
-    ip_problem = lan_ip_problem()
-    if ip_problem:
-        return fail(f"Cadastro não enviado. {ip_problem}", 500)
-
     try:
         photo_path = _save_upload(photo, name)
     except Exception as exc:
         logger.exception("Falha ao salvar foto")
         return fail(f"Não foi possível salvar a foto: {exc}", 500)
 
-    face_url = public_media_url(photo_path.name)
-    if not face_url:
-        return fail(
-            "SERVER_LAN_IP não está no .env. O facial precisa desse IP para baixar a foto deste PC.",
-            500,
-        )
     client = fleet_for_pool(pool)
     try:
-        created = client.register_member(
-            name,
-            photo_path,
-            face_public_url=face_url,
-        )
+        created = client.register_member(name, photo_path)
         expires_at = exam_expires_from(datetime.now())
         member = db.create_member(
             name=name,
@@ -437,15 +423,13 @@ def renovar(member_id: int):
             "error",
         )
         return _redirect_after_member_action(url_for("main.membros"))
-    face_url = None
     if photo_path is not None:
         try:
-            # Foto antiga em PNG: o facial baixa o JPEG convertido, não o arquivo original.
+            # Foto antiga em PNG: o facial recebe o JPEG convertido, não o arquivo original.
             photo_path = face_photo(photo_path)
         except DeviceError as exc:
             flash(f"A foto salva de {member.name} não abriu: {exc} Use o botão Foto.", "error")
             return _redirect_after_member_action(url_for("main.membros"))
-        face_url = public_media_url(photo_path.name)
 
     client = fleet_for_pool(member.pool)
     try:
@@ -454,7 +438,6 @@ def renovar(member_id: int):
             registration=member.registration,
             image_path=photo_path,
             previous_device_user_id=member.device_user_id,
-            face_public_url=face_url,
         )
         new_expires = exam_expires_from(datetime.now())
         updated = db.renew_member(member_id, expires_at=new_expires)
@@ -621,26 +604,11 @@ def adm_atualizar_foto(member_id: int):
         flash("Formato de foto inválido. Use JPG ou PNG.", "error")
         return _redirect_adm("socios")
 
-    ip_problem = lan_ip_problem()
-    if ip_problem and not member.access_blocked and not member.is_expired:
-        flash(f"Foto não enviada. {ip_problem}", "error")
-        return _redirect_adm("socios")
-
     try:
         photo_path = _save_upload(photo, member.name)
     except Exception as exc:
         logger.exception("Falha ao salvar nova foto")
         flash(f"Não foi possível salvar a foto: {exc}", "error")
-        return _redirect_adm("socios")
-
-    face_url = public_media_url(photo_path.name)
-    if not face_url and not member.access_blocked and not member.is_expired:
-        if photo_path.exists():
-            photo_path.unlink(missing_ok=True)
-        flash(
-            "SERVER_LAN_IP não está no .env. O facial precisa desse IP para receber a foto.",
-            "error",
-        )
         return _redirect_adm("socios")
 
     client = fleet_for_pool(member.pool)
@@ -652,7 +620,6 @@ def adm_atualizar_foto(member_id: int):
                 name=member.name,
                 registration=member.registration,
                 image_path=photo_path,
-                face_public_url=face_url,
             )
             db.update_member_photo(member_id, str(photo_path))
             db.update_device_user_id(member_id, created.device_user_id)
@@ -710,9 +677,6 @@ def _member_ready_for_facial(member: Optional[db.Member]):
         return jsonify({"ok": False, "error": "Membro não encontrado."}), 404
     if member.access_blocked or member.is_expired:
         return jsonify({"ok": False, "error": f"O exame de {member.name} está vencido: renove antes."}), 400
-    problem = lan_ip_problem()
-    if problem:
-        return jsonify({"ok": False, "error": problem}), 400
     return None
 
 
@@ -838,14 +802,12 @@ def adm_piscinas(member_id: int):
                 "error",
             )
             return _redirect_adm("socios")
-        face_url = public_media_url(photo.name)
         try:
             for url in added:
                 IntelbrasClient(base_url=url).renew_member(
                     name=member.name,
                     registration=member.registration,
                     image_path=photo,
-                    face_public_url=face_url,
                 )
         except DeviceError as exc:
             logger.exception("Falha ao incluir sócio em outra piscina")
@@ -1153,13 +1115,11 @@ def _reopen_on_device(member: db.Member) -> None:
         photo = None
     if photo is not None:
         photo = face_photo(photo)
-    face_url = public_media_url(photo.name) if photo is not None else None
     created = fleet_for_pool(member.pool).renew_member(
         name=member.name,
         registration=member.registration,
         image_path=photo,
         previous_device_user_id=member.device_user_id,
-        face_public_url=face_url,
     )
     if created.device_user_id and created.device_user_id != member.device_user_id:
         db.update_device_user_id(member.id, created.device_user_id)
