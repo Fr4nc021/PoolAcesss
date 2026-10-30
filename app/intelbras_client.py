@@ -308,7 +308,7 @@ class IntelbrasClient:
         try:
             with self._panel_http() as http:
                 intelbras_fcgi.login(http, self.base_url, self.login_name, self.password)
-                intelbras_fcgi.add_user_with_face(
+                self._panel_answer = intelbras_fcgi.add_user_with_face(
                     http, self.base_url, registration, name, Path(jpeg_path).read_bytes()
                 )
         except intelbras_fcgi.PanelUnavailable as exc:
@@ -342,7 +342,8 @@ class IntelbrasClient:
             if attempt + 1 < FACE_CONFIRM_RETRIES:
                 time.sleep(FACE_CONFIRM_DELAY)
         raise DeviceError(
-            f"O facial {self.base_url} recebeu o cadastro de {registration}, mas ele não apareceu na lista."
+            f"O facial {self.base_url} recebeu o cadastro de {registration}, mas ele não apareceu na lista. "
+            f"Resposta do painel: {getattr(self, '_panel_answer', '') or '(vazia)'}"
         )
 
     def create_user_with_face(

@@ -63,9 +63,6 @@
       Acessos
     </button>
     {% if is_local_request %}
-    <button type="button" class="adm-tab" role="tab" id="tab-teste" aria-selected="false" aria-controls="panel-teste" data-tab="teste">
-      Teste{% if test_members %} <span class="tab-count">{{ test_members|length }}</span>{% endif %}
-    </button>
     <button type="button" class="adm-tab adm-tab-config" role="tab" id="tab-config" aria-selected="false" aria-controls="panel-config" data-tab="config" title="Configurações">
       <svg class="gear" viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path fill="currentColor" d="M19.14 12.94a7.07 7.07 0 0 0 .05-.94 7.07 7.07 0 0 0-.05-.94l2.03-1.58a.49.49 0 0 0 .12-.61l-1.92-3.32a.49.49 0 0 0-.59-.22l-2.39.96a7.03 7.03 0 0 0-1.62-.94l-.36-2.54a.48.48 0 0 0-.48-.41h-3.84a.48.48 0 0 0-.48.41l-.36 2.54c-.59.24-1.13.56-1.62.94l-2.39-.96a.49.49 0 0 0-.59.22L2.74 8.87a.48.48 0 0 0 .12.61l2.03 1.58a7.4 7.4 0 0 0 0 1.88l-2.03 1.58a.49.49 0 0 0-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.48-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32a.49.49 0 0 0-.12-.61l-2.03-1.58ZM12 15.6A3.6 3.6 0 1 1 12 8.4a3.6 3.6 0 0 1 0 7.2Z"/></svg>
       Configurações
@@ -435,81 +432,6 @@
   </div>
 
   {% if is_local_request %}
-  <div class="adm-panel" id="panel-teste" role="tabpanel" aria-labelledby="tab-teste" data-panel="teste" hidden>
-    <h2>Teste de vencimento</h2>
-    <p class="lead">
-      Mude a data do exame de um sócio para ver o bloqueio no facial. Uma data já vencida apaga o sócio
-      do facial na hora; uma data futura bloqueia quando vencer (cadastros e renovações vencem às
-      {{ expiry_hour }}h, e a checagem também roda a cada 15 minutos). Quem está em teste fica só neste PC
-      e não vai para o outro PC nem para a nuvem. Ao encerrar, a data original volta e, se ainda valer,
-      a face volta para o facial. Fechar o programa também encerra os testes.
-    </p>
-
-    {% if all_members %}
-    <form id="test-form" class="test-form">
-      <label>
-        <span>Sócio</span>
-        <select name="member_id" required>
-          <option value="">Escolha…</option>
-          {% for m in all_members %}
-          <option value="{{ m.id }}">{{ m.name }} ({{ m.registration }}) — até {{ m.medical_exam_expires_at.strftime('%d/%m/%Y %H:%M') }}</option>
-          {% endfor %}
-        </select>
-      </label>
-      <label>
-        <span>Exame vale até</span>
-        <input type="datetime-local" name="expires_at" value="{{ now_input }}" required>
-      </label>
-      <div class="test-presets" role="group" aria-label="Atalhos de data">
-        <button type="button" class="filter-btn" data-offset-min="-1">Venceu há 1 min</button>
-        <button type="button" class="filter-btn" data-offset-min="2">Vence em 2 min</button>
-        <button type="button" class="filter-btn" data-offset-min="1440">Amanhã</button>
-      </div>
-      <div class="test-actions">
-        <button type="submit" class="btn btn-primary">Gravar data</button>
-        <button type="button" class="btn btn-secondary" id="btn-test-check">Rodar checagem agora</button>
-      </div>
-    </form>
-    <p class="hint test-error is-bad" id="test-error" hidden></p>
-    {% else %}
-    <p class="empty">Nenhum sócio cadastrado ainda.</p>
-    {% endif %}
-
-    <h3 class="subhead">Em teste</h3>
-    {% if test_members %}
-    <div class="table-wrap">
-      <table class="members-table">
-        <thead>
-          <tr>
-            <th>Nome</th>
-            <th>Data original</th>
-            <th>Data de teste</th>
-            <th>Status</th>
-            <th></th>
-          </tr>
-        </thead>
-        <tbody>
-          {% for row in test_members %}
-          {% set m = row.member %}
-          <tr>
-            <td>{{ m.name }}</td>
-            <td>{{ row.original.strftime('%d/%m/%Y %H:%M') }}</td>
-            <td>{{ m.medical_exam_expires_at.strftime('%d/%m/%Y %H:%M') }}</td>
-            <td><span class="badge {{ m.status_class }}">{{ m.status_label }}</span></td>
-            <td class="actions">
-              <button type="button" class="btn btn-secondary btn-sm" data-test-end="{{ m.id }}"
-                      data-confirm="Encerrar o teste de {{ m.name }} e voltar o exame para {{ row.original.strftime('%d/%m/%Y %H:%M') }}?">Encerrar teste</button>
-            </td>
-          </tr>
-          {% endfor %}
-        </tbody>
-      </table>
-    </div>
-    {% else %}
-    <p class="empty">Nenhum sócio em teste.</p>
-    {% endif %}
-  </div>
-
   <div class="adm-panel" id="panel-config" role="tabpanel" aria-labelledby="tab-config" data-panel="config" hidden>
     <h2>Configurações</h2>
     <p class="lead">
@@ -541,31 +463,14 @@
         </div>
         <div class="config-actions">
           <button type="button" class="btn btn-secondary" id="btn-test-devices">Testar faciais</button>
-          <button type="button" class="btn btn-secondary" id="btn-test-validity">Testar validade no facial</button>
         </div>
         <div id="devices-test" class="sync-test" hidden aria-live="polite"></div>
-        <div id="validity-test" class="sync-test" hidden aria-live="polite">
-          <p>Resultado do teste de validade. Copie todo o texto abaixo e envie para análise.</p>
-          <textarea id="validity-result" rows="12" readonly></textarea>
-        </div>
         <div class="config-actions">
           <button type="button" class="btn" id="btn-facial-reset">Refazer faciais do zero</button>
         </div>
         <div id="facial-reset" class="sync-test face-audit" hidden aria-live="polite">
           <p id="facial-reset-status"></p>
           <div id="facial-reset-result"></div>
-        </div>
-        <div class="config-actions">
-          <button type="button" class="btn btn-secondary" id="btn-test-faceid">Testar FaceID no facial</button>
-          <label class="field faceid-photo">
-            <span>Foto de alguém da equipe (opcional; sem foto o teste só lê)</span>
-            <input type="file" id="faceid-photo" accept="image/*">
-          </label>
-        </div>
-        <div id="faceid-test" class="sync-test" hidden aria-live="polite">
-          <p id="faceid-status"></p>
-          <ul id="faceid-affected" class="audit-list" hidden></ul>
-          <textarea id="faceid-result" rows="14" readonly></textarea>
         </div>
       </fieldset>
 
@@ -677,7 +582,7 @@
 </section>
 
 <script>
-  const tabNames = ["socios", "vencimentos", "acessos", "teste", "config"];
+  const tabNames = ["socios", "vencimentos", "acessos", "config"];
   const tabButtons = Array.from(document.querySelectorAll(".adm-tab"));
   const panels = Array.from(document.querySelectorAll("[data-panel]"));
 
@@ -858,30 +763,6 @@
   const peerStatus = document.getElementById("peer-status");
   const syncTest = document.getElementById("sync-test");
   const syncTestButton = document.getElementById("btn-test-sync");
-  const validityButton = document.getElementById("btn-test-validity");
-  if (validityButton) {
-    validityButton.addEventListener("click", async () => {
-      if (!window.confirm(
-        "O teste cria um usuário TESTE VALIDADE sem foto em cada facial, tenta gravar uma data de validade e apaga o usuário no final. Nenhum sócio é alterado. Continuar?"
-      )) return;
-      const box = document.getElementById("validity-test");
-      const out = document.getElementById("validity-result");
-      validityButton.disabled = true;
-      box.hidden = false;
-      out.value = "Testando os faciais...";
-      try {
-        const response = await fetch("/adm/testar-validade", {
-          method: "POST",
-          headers: { Accept: "application/json", "X-Acesso-Local": "1" },
-        });
-        out.value = JSON.stringify(await response.json(), null, 2);
-      } catch (err) {
-        out.value = "Falha no teste: " + (err.message || err);
-      }
-      validityButton.disabled = false;
-    });
-  }
-
   const resetButton = document.getElementById("btn-facial-reset");
   if (resetButton) {
     const resetStatus = document.getElementById("facial-reset-status");
@@ -967,58 +848,6 @@
       .then((response) => response.json())
       .then((state) => { if (state.running) pollReset(); })
       .catch(() => {});
-  }
-
-  const faceIdButton = document.getElementById("btn-test-faceid");
-  if (faceIdButton) {
-    faceIdButton.addEventListener("click", async () => {
-      if (!window.confirm(
-        document.getElementById("faceid-photo").files[0]
-          ? "Com a foto escolhida, o teste cadastra um usuário TESTE FACEID em cada facial pelo mesmo caminho dos sócios, mostra o FaceID que ele ganhou e de quem esse número já era, e apaga no final. Use a foto de alguém da equipe. Se algum sócio for afetado, o resultado mostra o nome. Continuar?"
-          : "Sem foto, o teste só lê os faciais: mostra o ID, o FaceID, o modelo do rosto e a foto guardada de cada usuário. Não mexe em nada. Continuar?"
-      )) return;
-      const box = document.getElementById("faceid-test");
-      const status = document.getElementById("faceid-status");
-      const affected = document.getElementById("faceid-affected");
-      const out = document.getElementById("faceid-result");
-      const file = document.getElementById("faceid-photo").files[0];
-      faceIdButton.disabled = true;
-      box.hidden = false;
-      affected.hidden = true;
-      affected.replaceChildren();
-      status.textContent = "Testando os faciais... não feche a tela.";
-      out.value = "";
-      try {
-        const body = new FormData();
-        if (file) body.append("photo", file);
-        const response = await fetch("/adm/testar-faceid", {
-          method: "POST",
-          headers: { Accept: "application/json", "X-Acesso-Local": "1" },
-          body,
-        });
-        const data = await response.json();
-        out.value = JSON.stringify(data, null, 2);
-        if (!response.ok || !data.ok) throw new Error(data.error || "Falha no teste.");
-        const hurt = [];
-        for (const report of data.relatorios || []) {
-          if (Array.isArray(report.afetados)) {
-            report.afetados.forEach((row) => hurt.push(`Afetado: ${row.nome} (${row.matricula}) em ${report.facial}: mudou ${row.mudou}`));
-          }
-        }
-        status.textContent = hurt.length
-          ? "Teste terminado. Confira os sócios abaixo na conferência de fotos (\"Enviar foto do sistema\" neles). Copie todo o texto e envie para análise."
-          : "Teste terminado, nada a corrigir. Copie todo o texto abaixo e envie para análise.";
-        hurt.forEach((line) => {
-          const li = document.createElement("li");
-          li.textContent = line;
-          affected.appendChild(li);
-        });
-        affected.hidden = !hurt.length;
-      } catch (err) {
-        status.textContent = "Falha no teste: " + (err.message || err) + " Copie o texto abaixo e envie para análise.";
-      }
-      faceIdButton.disabled = false;
-    });
   }
 
   const auditButton = document.getElementById("btn-face-audit");
@@ -1277,61 +1106,10 @@
       .catch(() => {});
   }
 
-  const testForm = document.getElementById("test-form");
-  const testError = document.getElementById("test-error");
-
-  async function postTest(url, body) {
-    if (testError) testError.hidden = true;
-    try {
-      const response = await fetch(url, {
-        method: "POST",
-        headers: { Accept: "application/json", "Content-Type": "application/json", "X-Acesso-Local": "1" },
-        body: JSON.stringify(body || {}),
-      });
-      const data = await response.json();
-      if (!response.ok || !data.ok) throw new Error(data.error || "Falha no teste.");
-      location.hash = "#teste";
-      location.reload();
-    } catch (err) {
-      if (!testError) return;
-      testError.textContent = err.message || String(err);
-      testError.hidden = false;
-    }
-  }
-
   function toLocalInput(date) {
     const pad = (n) => String(n).padStart(2, "0");
     return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`;
   }
-
-  if (testForm) {
-    testForm.querySelectorAll("[data-offset-min]").forEach((button) => {
-      button.addEventListener("click", () => {
-        const when = new Date(Date.now() + Number(button.dataset.offsetMin) * 60000);
-        testForm.elements.expires_at.value = toLocalInput(when);
-      });
-    });
-    testForm.addEventListener("submit", (event) => {
-      event.preventDefault();
-      postTest("/adm/teste/data", {
-        member_id: testForm.elements.member_id.value,
-        expires_at: testForm.elements.expires_at.value,
-      });
-    });
-    document.getElementById("btn-test-check")?.addEventListener("click", (event) => {
-      event.currentTarget.disabled = true;
-      event.currentTarget.textContent = "Checando…";
-      postTest("/adm/teste/checar");
-    });
-  }
-
-  document.querySelectorAll("[data-test-end]").forEach((button) => {
-    button.addEventListener("click", () => {
-      if (!window.confirm(button.dataset.confirm)) return;
-      button.disabled = true;
-      postTest(`/adm/teste/${button.dataset.testEnd}/encerrar`);
-    });
-  });
 
   const localHeaders = { Accept: "application/json", "Content-Type": "application/json", "X-Acesso-Local": "1" };
   const configForm = document.getElementById("config-form");

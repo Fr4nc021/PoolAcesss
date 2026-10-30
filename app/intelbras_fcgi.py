@@ -32,7 +32,6 @@ _SINGLE_RESULT = (
     re.compile(rf"id={_Q}hcSingleResult{_Q}[^>]*value={_Q}([^\"'\s>]*)"),
     re.compile(rf"value={_Q}([^\"'\s>]*){_Q}[^>]*id={_Q}hcSingleResult\b"),
 )
-_LOGIN_FAILED = re.compile(rf"id={_Q}hcLoginStatus{_Q}[^>]*value={_Q}-1\b|value={_Q}-1{_Q}[^>]*id={_Q}hcLoginStatus\b")
 
 
 # Mesma troca que o PostEncode do painel (js/common.js do facial). O facial lê
@@ -104,11 +103,10 @@ def login(http: httpx.Client, base_url: str, user: str, password: str) -> None:
         f"{base_url}/fcgi/do?id=1",
         data={"SubmitData": "begin&Operation=CreateSession&DestURL=id=1&SubmitData=end"},
     )
+    # A resposta é a página inteira do painel, que já traz um hcLoginStatus -1
+    # de modelo: não dá para julgar a sessão por ela. Quem confere é o cadastro
+    # (a pessoa tem que aparecer na lista do facial).
     response.raise_for_status()
-    if _LOGIN_FAILED.search(response.text):
-        raise PanelError(
-            f"O facial recusou a sessão do painel (CreateSession). Resposta: {_answer(response.text, password)}"
-        )
 
 
 def add_user_with_face(
@@ -120,8 +118,8 @@ def add_user_with_face(
     *,
     relay: str = "1",
     validity: str = "0",
-) -> None:
-    """O mesmo pedido do botão Salvar do painel ao criar um usuário com foto."""
+) -> str:
+    """O mesmo pedido do botão Salvar do painel ao criar um usuário com foto. Devolve o que o facial respondeu."""
     if not registration_fits(registration):
         raise PanelError("Matrícula precisa ter só letras e números, até 11 caracteres.")
     # Barra separa os campos: no nome ela vai codificada pelo PostEncode, como no painel.
@@ -132,3 +130,4 @@ def add_user_with_face(
         files={"importUserFacePhoto": ("foto.jpg", jpeg, "image/jpeg")},
     )
     response.raise_for_status()
+    return _answer(response.text, "")
