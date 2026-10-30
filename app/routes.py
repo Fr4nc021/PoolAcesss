@@ -20,7 +20,7 @@ from flask import (
 )
 from werkzeug.utils import secure_filename
 
-from app import db, exam_test
+from app import db
 from app import settings as app_settings
 from app.config import (
     PHOTOS_DIR,
@@ -526,8 +526,6 @@ def adm():
             limit=40,
             results=["registered", "renewed", "photo_updated", "pool_updated", "expiry_changed", "deleted"],
         ),
-        test_members=_test_members(),
-        now_input=now.strftime("%Y-%m-%dT%H:%M"),
         removed_at=db.last_removal_times(),
         settings=app_settings.current() if is_local else None,
         net=_network_info() if is_local else None,
@@ -548,18 +546,6 @@ def _network_info() -> dict:
         "self_url": f"http://{configured}:{PORT}" if configured else "",
         "port": PORT,
     }
-
-
-def _test_members() -> list[dict]:
-    rows = []
-    for registration, original in exam_test.held().items():
-        member = db.get_member_by_registration(registration)
-        if member is None:
-            exam_test.release(registration)
-            continue
-        rows.append({"member": member, "original": original})
-    rows.sort(key=lambda row: row["member"].name.lower())
-    return rows
 
 
 @bp.post("/adm/membros/<int:member_id>/bloquear")
@@ -858,9 +844,6 @@ def adm_validade(member_id: int):
         flash("Membro não encontrado.", "error")
         return _redirect_adm("socios")
     tab = (request.form.get("return_tab") or "socios").strip()
-    if exam_test.is_held(member.registration):
-        flash(f"{member.name} está na aba Teste. Encerre o teste antes de mudar a validade.", "error")
-        return _redirect_adm(tab)
     try:
         expires_at = datetime.strptime(request.form.get("expires_at") or "", "%Y-%m-%dT%H:%M")
     except ValueError:
@@ -1054,17 +1037,6 @@ def fechar_aba():
     return ("", 204)
 
 
-@bp.post("/adm/testar-validade")
-def adm_testar_validade():
-    """Teste do formato de data de validade nos faciais. Só pelo próprio PC."""
-    if not _local_admin_request():
-        return jsonify({"ok": False, "error": "Rode o teste no PC onde o programa está aberto."}), 403
-    from app.validity_probe import run_probe
-
-    reports = [run_probe(client) for client in DeviceFleet().clients]
-    return jsonify({"ok": True, "version": VERSION, "relatorios": reports})
-
-
 @bp.post("/adm/refazer-faciais")
 def adm_refazer_faciais():
     """Apaga e recadastra os faciais do zero, em segundo plano. Só pelo próprio PC."""
@@ -1083,35 +1055,6 @@ def adm_refazer_faciais_status():
     return jsonify({"ok": True, **facial_reset.status()})
 
 
-@bp.post("/adm/testar-faceid")
-@_blocks_update
-def adm_testar_faceid():
-    """Teste de como cada facial escolhe o FaceID. Só pelo próprio PC."""
-    if not _local_admin_request():
-        return jsonify({"ok": False, "error": "Rode o teste no PC onde o programa está aberto."}), 403
-    from concurrent.futures import ThreadPoolExecutor
-
-    from app import faceid_probe
-
-    photo = None
-    upload = request.files.get("photo")
-    if upload and upload.filename:
-        try:
-            photo = faceid_probe.prepared_photo(upload.read())
-        except DeviceError as exc:
-            return jsonify({"ok": False, "error": f"A foto de teste não abriu: {exc}"}), 400
-    clients = DeviceFleet().clients
-    with ThreadPoolExecutor(max_workers=max(1, len(clients))) as executor:
-        reports = list(executor.map(lambda client: faceid_probe.run_probe(client, photo), clients))
-    return jsonify({"ok": True, "version": VERSION, "relatorios": reports})
-
-
-def _test_forbidden():
-    if _local_admin_request():
-        return None
-    return jsonify({"ok": False, "error": "Use a aba Teste no PC onde o programa está aberto."}), 403
-
-
 def _reopen_on_device(member: db.Member) -> None:
     """Devolve a face ao facial de quem foi bloqueado (teste ou validade nova no ADM)."""
     photo = Path(member.photo_path) if member.photo_path else None
@@ -1127,114 +1070,6 @@ def _reopen_on_device(member: db.Member) -> None:
     )
     if created.device_user_id and created.device_user_id != member.device_user_id:
         db.update_device_user_id(member.id, created.device_user_id)
-
-
-def _set_test_expiry(member: db.Member, expires_at: datetime) -> db.Member:
-    """Grava a data. Se o sócio estava bloqueado e a data nova ainda vale, libera no facial."""
-    reopen = member.access_blocked and expires_at > datetime.now()
-    if reopen:
-        _reopen_on_device(member)
-    updated = db.set_exam_expiry(member.id, expires_at, unblock=reopen)
-    return updated or member
-
-
-@bp.post("/adm/teste/data")
-@_blocks_update
-def adm_teste_data():
-    """Muda a data do exame de um sócio para testar o vencimento."""
-    forbidden = _test_forbidden()
-    if forbidden:
-        return forbidden
-    data = request.get_json(silent=True) or {}
-    try:
-        member_id = int(data.get("member_id"))
-        expires_at = datetime.strptime(str(data.get("expires_at") or ""), "%Y-%m-%dT%H:%M")
-    except (TypeError, ValueError):
-        return jsonify({"ok": False, "error": "Escolha o sócio e a data do exame."}), 400
-    member = db.get_member(member_id)
-    if member is None:
-        return jsonify({"ok": False, "error": "Sócio não encontrado."}), 404
-
-    exam_test.hold(member.registration, member.medical_exam_expires_at)
-    try:
-        updated = _set_test_expiry(member, expires_at)
-    except DeviceError as exc:
-        logger.exception("Falha ao liberar no facial durante o teste")
-        return jsonify({"ok": False, "error": f"Não foi possível liberar no facial: {exc}"}), 502
-    logger.info(
-        "Teste de vencimento: %s com exame até %s",
-        member.registration,
-        expires_at.isoformat(timespec="minutes"),
-    )
-    from app.expiry import reschedule
-
-    reschedule()
-    when = updated.medical_exam_expires_at.strftime("%d/%m/%Y %H:%M")
-    if updated.is_expired and not updated.access_blocked:
-        # Data vencida bloqueia na hora, sem esperar a checagem de 15 minutos.
-        from app.expiry import block_member_on_devices
-
-        if not block_member_on_devices(updated, fleet_for_pool(updated.pool)):
-            flash(
-                f"Teste: exame de {updated.name} venceu em {when}, mas o facial não apagou o "
-                "sócio. Veja se os faciais estão ligados e use “Rodar checagem agora”.",
-                "error",
-            )
-            return jsonify({"ok": True, "blocked": False})
-        request_sync()
-        flash(
-            f"Teste: exame de {updated.name} venceu em {when}. Sócio apagado do facial: "
-            "o leitor já deve negar o acesso.",
-            "success",
-        )
-        return jsonify({"ok": True, "blocked": True})
-    flash(f"Teste: exame de {updated.name} vale até {when}.", "success")
-    return jsonify({"ok": True})
-
-
-@bp.post("/adm/teste/checar")
-@_blocks_update
-def adm_teste_checar():
-    """Roda agora a checagem que bloqueia vencidos (normalmente a cada 15 min)."""
-    forbidden = _test_forbidden()
-    if forbidden:
-        return forbidden
-    from app.expiry import sync_expired_members
-
-    blocked = sync_expired_members()
-    if blocked:
-        flash(f"Checagem feita: {blocked} sócio(s) bloqueado(s) por exame vencido.", "success")
-    else:
-        flash("Checagem feita: nenhum sócio novo para bloquear.", "success")
-    return jsonify({"ok": True, "blocked": blocked})
-
-
-@bp.post("/adm/teste/<int:member_id>/encerrar")
-@_blocks_update
-def adm_teste_encerrar(member_id: int):
-    """Volta a data original do exame e solta o sócio para a sincronização."""
-    forbidden = _test_forbidden()
-    if forbidden:
-        return forbidden
-    member = db.get_member(member_id)
-    if member is None:
-        return jsonify({"ok": False, "error": "Sócio não encontrado."}), 404
-    original = exam_test.held().get(member.registration)
-    if original is None:
-        return jsonify({"ok": False, "error": "Esse sócio não está em teste."}), 400
-    try:
-        updated = _set_test_expiry(member, original)
-    except DeviceError as exc:
-        logger.exception("Falha ao liberar no facial ao encerrar o teste")
-        return jsonify({"ok": False, "error": f"Não foi possível liberar no facial: {exc}"}), 502
-    exam_test.release(member.registration)
-    request_sync()
-    flash(
-        f"Teste encerrado: exame de {updated.name} voltou para "
-        f"{updated.medical_exam_expires_at.strftime('%d/%m/%Y %H:%M')}.",
-        "success",
-    )
-    return jsonify({"ok": True})
 
 
 @bp.get("/atualizacao/estado")
