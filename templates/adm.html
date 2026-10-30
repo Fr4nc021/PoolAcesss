@@ -549,6 +549,13 @@
           <textarea id="validity-result" rows="12" readonly></textarea>
         </div>
         <div class="config-actions">
+          <button type="button" class="btn" id="btn-facial-reset">Refazer faciais do zero</button>
+        </div>
+        <div id="facial-reset" class="sync-test face-audit" hidden aria-live="polite">
+          <p id="facial-reset-status"></p>
+          <div id="facial-reset-result"></div>
+        </div>
+        <div class="config-actions">
           <button type="button" class="btn btn-secondary" id="btn-test-faceid">Testar FaceID no facial</button>
           <label class="field faceid-photo">
             <span>Foto de alguém da equipe (opcional; sem foto o teste só lê)</span>
@@ -873,6 +880,89 @@
       }
       validityButton.disabled = false;
     });
+  }
+
+  const resetButton = document.getElementById("btn-facial-reset");
+  if (resetButton) {
+    const resetStatus = document.getElementById("facial-reset-status");
+    const resetResult = document.getElementById("facial-reset-result");
+    const phases = { esperando: "esperando", lendo: "guardando cópia", apagando: "apagando", cadastrando: "cadastrando", pronto: "pronto", erro: "erro" };
+
+    const addList = (title, items) => {
+      if (!items || !items.length) return;
+      const h = document.createElement("h4");
+      h.textContent = title;
+      resetResult.appendChild(h);
+      const ul = document.createElement("ul");
+      ul.className = "audit-list";
+      items.forEach((text) => {
+        const li = document.createElement("li");
+        li.textContent = text;
+        ul.appendChild(li);
+      });
+      resetResult.appendChild(ul);
+    };
+
+    function renderReset(state) {
+      document.getElementById("facial-reset").hidden = false;
+      resetResult.replaceChildren();
+      const lines = (state.devices || []).map((d) => {
+        let text = `${d.label}: ${phases[d.phase] || d.phase}`;
+        if (d.total) text += ` — ${d.done || 0} de ${d.total}`;
+        if (d.current) text += ` (${d.current})`;
+        return text;
+      });
+      resetStatus.textContent = state.running
+        ? "Refazendo... não feche o programa. " + lines.join(" · ")
+        : (state.error ? "Parou: " + state.error : "Terminado. " + lines.join(" · ") + ". Rode \"Conferir fotos no Intelbras\" para ver como ficou.");
+      if (state.running) return;
+      for (const d of state.devices || []) {
+        if (d.error) addList(`${d.label}: parou`, [d.error]);
+        addList(`${d.label}: refeitos depois do número repetido`, d.repaired);
+        addList(`${d.label}: ficaram sem cadastro`, d.missing);
+        addList(`${d.label}: falharam`, (d.failed || []).map((f) => `${f.name}: ${f.erro}`));
+        addList(`${d.label}: não mexidos`, (d.untouched || []).map((u) => `${u.name}: ${u.motivo}`));
+        addList(`${d.label}: removidos (vencidos, de outra piscina ou registro antigo)`, d.removed);
+        if (d.backup) addList(`${d.label}: cópia do facial guardada em`, [d.backup]);
+      }
+    }
+
+    async function pollReset() {
+      try {
+        const response = await fetch("/adm/refazer-faciais", { headers: { Accept: "application/json" } });
+        const state = await response.json();
+        if (!state.devices) return;
+        renderReset(state);
+        resetButton.disabled = !!state.running;
+        if (state.running) setTimeout(pollReset, 1500);
+      } catch (err) {
+        setTimeout(pollReset, 3000);
+      }
+    }
+
+    resetButton.addEventListener("click", async () => {
+      if (!window.confirm(
+        "Isso apaga os usuários de cada facial e cadastra de novo, um por um, com a foto do sistema (funcionários que só existem no facial voltam com a foto do próprio facial). Começa pela piscina normal. Antes, guarda uma cópia de cada facial no PC. Se o facial repetir o número de rosto, para na hora e mostra quem ficou sem cadastro. Durante o processo, quem ainda não foi recadastrado não entra. Continuar?"
+      )) return;
+      resetButton.disabled = true;
+      try {
+        const response = await fetch("/adm/refazer-faciais", {
+          method: "POST",
+          headers: { Accept: "application/json", "X-Acesso-Local": "1" },
+        });
+        const data = await response.json();
+        if (!data.ok) throw new Error(data.error || "Não foi possível começar.");
+        pollReset();
+      } catch (err) {
+        resetButton.disabled = false;
+        window.alert(err.message || String(err));
+      }
+    });
+
+    fetch("/adm/refazer-faciais", { headers: { Accept: "application/json" } })
+      .then((response) => response.json())
+      .then((state) => { if (state.running) pollReset(); })
+      .catch(() => {});
   }
 
   const faceIdButton = document.getElementById("btn-test-faceid");

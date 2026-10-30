@@ -342,6 +342,11 @@ class IntelbrasClient:
                     ),
                 )
             )
+            # Nos faciais do clube só o envio por endereço gera o rosto: base64,
+            # RegisterImg e multipart falharam nos dois. Tentar todos deixava cada
+            # cadastro em minutos de espera, então com endereço vai só ele.
+            return attempts
+        # Sem endereço (sem SERVER_LAN_IP) sobram os outros jeitos.
         # O import do UserData.tgz grava a foto sem gerar o modelo do rosto, então não entra aqui.
         attempts.extend(
             [
@@ -492,7 +497,8 @@ class IntelbrasClient:
             device_user_id=device_user_id,
             face_public_url=face_public_url,
         )
-        for round_num in range(FACE_SEND_ROUNDS):
+        rounds = 1 if len(attempts) == 1 else FACE_SEND_ROUNDS
+        for round_num in range(rounds):
             for label, action in attempts:
                 try:
                     action()
@@ -520,7 +526,7 @@ class IntelbrasClient:
                     round_num + 1,
                     registration,
                 )
-            if round_num + 1 < FACE_SEND_ROUNDS:
+            if round_num + 1 < rounds:
                 time.sleep(1.5)
         return False
 
@@ -537,12 +543,13 @@ class IntelbrasClient:
         registrations = [
             u.user_id for u in exported if face_id and u.face_id == face_id and u.user_id != str(registration)
         ]
-        # O facial junta no mesmo FaceID um rosto que ele acha que já conhece:
-        # quase sempre a foto salva é da outra pessoa ou parecida demais com ela.
+        # Na térmica e na normal, todo rosto novo caiu no FaceID do último
+        # cadastrado, com pessoas diferentes: é a contagem do aparelho, não a foto.
         raise FaceIDConflict(
-            f"O facial {self.base_url} achou que a foto de {name} é o rosto de "
-            f"{', '.join(others)} e juntou os dois no mesmo FaceID. Confira se a foto "
-            f"salva de {name} é mesmo dela/dele; se não for, tire uma foto nova pelo botão Foto.",
+            f"O facial {self.base_url} repetiu o número de rosto (FaceID) de "
+            f"{', '.join(others)} para {name}. Isso é defeito do aparelho, não da foto: "
+            "reinicie o facial e tente de novo; se continuar, use ADM > Configurações > "
+            "Refazer facial do zero ou fale com a Intelbras.",
             registrations,
         )
 

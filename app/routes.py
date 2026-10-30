@@ -1099,6 +1099,24 @@ def adm_testar_validade():
     return jsonify({"ok": True, "version": VERSION, "relatorios": reports})
 
 
+@bp.post("/adm/refazer-faciais")
+def adm_refazer_faciais():
+    """Apaga e recadastra os faciais do zero, em segundo plano. Só pelo próprio PC."""
+    if not _local_admin_request():
+        return jsonify({"ok": False, "error": "Rode no PC onde o programa está aberto."}), 403
+    from app import facial_reset
+
+    ok, message = facial_reset.start()
+    return jsonify({"ok": ok, "message": message, "error": None if ok else message}), (202 if ok else 409)
+
+
+@bp.get("/adm/refazer-faciais")
+def adm_refazer_faciais_status():
+    from app import facial_reset
+
+    return jsonify({"ok": True, **facial_reset.status()})
+
+
 @bp.post("/adm/testar-faceid")
 @_blocks_update
 def adm_testar_faceid():

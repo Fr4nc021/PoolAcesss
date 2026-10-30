@@ -206,11 +206,18 @@ def _record(fix: Fix, ok: bool, message: str) -> None:
 
 
 def _run_device(fixes: list[Fix]) -> None:
-    for fix in fixes:
+    for index, fix in enumerate(fixes):
         with _lock:
             _state["current"] = f"{fix.name} ({fix.label})"
         try:
             ok, message = _apply(fix)
+        except FaceIDConflict as exc:
+            # O facial repete o número do último rosto: cada tentativa a mais só
+            # tiraria outro sócio do facial. Para neste facial.
+            _record(fix, False, str(exc))
+            for skipped in fixes[index + 1:]:
+                _record(skipped, False, "Não tentado: o facial está repetindo o número de rosto. Reinicie o facial.")
+            return
         except DeviceError as exc:
             ok, message = False, str(exc)
         except Exception as exc:  # noqa: BLE001 — um sócio não pode parar a correção dos outros
