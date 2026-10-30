@@ -27,10 +27,14 @@ import httpx
 
 # Limite que o painel aplica à matrícula.
 PANEL_REGISTRATION = re.compile(r"[0-9A-Za-z]{1,11}")
+# O facial escreve sem aspas no id e com aspas simples no valor:
+# <input id=hcSingleResult type=hidden value='c14f...'>. Aceita os dois jeitos.
+_Q = "[\"']?"
 _SINGLE_RESULT = (
-    re.compile(r'id="hcSingleResult"[^>]*value="([^"]*)"'),
-    re.compile(r'value="([^"]*)"[^>]*id="hcSingleResult"'),
+    re.compile(rf"id={_Q}hcSingleResult{_Q}[^>]*value={_Q}([^\"'\s>]*)"),
+    re.compile(rf"value={_Q}([^\"'\s>]*){_Q}[^>]*id={_Q}hcSingleResult\b"),
 )
+_LOGIN_FAILED = re.compile(rf"id={_Q}hcLoginStatus{_Q}[^>]*value={_Q}-1\b|value={_Q}-1{_Q}[^>]*id={_Q}hcLoginStatus\b")
 
 
 class PanelUnavailable(Exception):
@@ -88,7 +92,7 @@ def login(http: httpx.Client, base_url: str, user: str, password: str) -> None:
         data={"SubmitData": "begin&Operation=CreateSession&DestURL=id=1&SubmitData=end"},
     )
     response.raise_for_status()
-    if 'id="hcLoginStatus"' in response.text and 'value="-1"' in response.text:
+    if _LOGIN_FAILED.search(response.text):
         raise PanelError(
             f"O facial recusou a sessão do painel (CreateSession). Resposta: {_answer(response.text, password)}"
         )

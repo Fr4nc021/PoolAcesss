@@ -80,9 +80,9 @@ class FakeDevice:
         if params.get("action") == "Encrypt":
             ok = params.get("UserName") == "admin" and params.get("Password") == self.panel_password
             value = f"enc-{self.panel_password}" if ok else "-1"
-            return httpx.Response(200, text=f'<input type="hidden" id="hcSingleResult" value="{value}">')
+            return httpx.Response(200, text=f"<form name='hiddenValForm_Div'> <input id=hcSingleResult type=hidden value='{value}'> </form>")
         if params.get_list("id") == ["1"]:
-            return httpx.Response(200, text=f'<input id="hcLoginStatus" value="{1 if logged else -1}">')
+            return httpx.Response(200, text=f"<input id=hcLoginStatus type=hidden value='{1 if logged else -1}'>")
         if params.get_list("id") == ["16", "5"]:
             assert logged, "cadastro sem a sessão do painel"
             body = request.read()
