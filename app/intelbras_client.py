@@ -18,6 +18,8 @@ from typing import Any, Callable, Optional
 import httpx
 from PIL import Image, ImageOps
 
+from app import intelbras_fcgi
+
 from app.config import (
     DOOR_NUM,
     PORT,
@@ -35,6 +37,8 @@ FACE_VALIDITY_ALWAYS = "0"
 FACE_SEND_ROUNDS = 3
 FACE_CONFIRM_RETRIES = 8
 FACE_CONFIRM_DELAY = 1.5
+# Pelo painel o facial leva uns 20 s para gerar o modelo do rosto.
+PANEL_CONFIRM_RETRIES = 20
 FACE_MIN_SIDE = 250
 FACE_MAX_SIDE = 800
 FACE_MIN_BYTES = 1000
@@ -423,6 +427,58 @@ class IntelbrasClient:
             )
         return user
 
+    def _panel_http(self) -> httpx.Client:
+        """Sessão do painel web: login por cookie, sem Basic Auth."""
+        return httpx.Client(timeout=self.timeout, follow_redirects=True)
+
+    def _add_via_panel(self, name: str, registration: str, jpeg_path: Path) -> bool:
+        """Cria usuário e rosto pelo /fcgi, como o painel. Falso se este facial não tem o /fcgi.
+
+        Pela API, os faciais do clube davam a todo rosto novo o FaceID do
+        último cadastrado; pelo caminho do painel, cada um recebe o seu.
+        """
+        if not intelbras_fcgi.registration_fits(registration):
+            logger.info("Matrícula %s não cabe no painel: cadastro pela API", registration)
+            return False
+        try:
+            with self._panel_http() as http:
+                intelbras_fcgi.login(http, self.base_url, self.login_name, self.password)
+                intelbras_fcgi.add_user_with_face(
+                    http, self.base_url, registration, name, Path(jpeg_path).read_bytes()
+                )
+        except intelbras_fcgi.PanelUnavailable as exc:
+            logger.info("Cadastro pela API: %s", exc)
+            return False
+        except intelbras_fcgi.PanelError as exc:
+            raise DeviceError(f"{self.base_url}: {exc}") from exc
+        except httpx.HTTPError as exc:
+            raise DeviceError(f"Falha ao cadastrar pelo painel do facial {self.base_url}: {exc}") from exc
+        return True
+
+    def _has_panel(self) -> bool:
+        """O facial aceita o login do painel (/fcgi)."""
+        try:
+            with self._panel_http() as http:
+                intelbras_fcgi.login(http, self.base_url, self.login_name, self.password)
+        except intelbras_fcgi.PanelUnavailable:
+            return False
+        except intelbras_fcgi.PanelError as exc:
+            raise DeviceError(f"{self.base_url}: {exc}") from exc
+        except httpx.HTTPError as exc:
+            raise DeviceError(f"Não foi possível entrar no painel do facial {self.base_url}: {exc}") from exc
+        return True
+
+    def _wait_for_user(self, registration: str) -> dict[str, Any]:
+        for attempt in range(FACE_CONFIRM_RETRIES):
+            user = self.find_user_by_registration(registration)
+            if user:
+                return user
+            if attempt + 1 < FACE_CONFIRM_RETRIES:
+                time.sleep(FACE_CONFIRM_DELAY)
+        raise DeviceError(
+            f"O facial {self.base_url} recebeu o cadastro de {registration}, mas ele não apareceu na lista."
+        )
+
     def create_user_with_face(
         self,
         name: str,
@@ -435,16 +491,22 @@ class IntelbrasClient:
         reg = (registration or f"AP{int(time.time()) % 100000000:08d}")[:12]
         jpeg_path = image_path if image_ready else _ensure_jpeg_file(image_path)
 
-        user = self._add_plain_user(name, reg)
-        device_id = int(user["ID"])
         try:
-            face_ok = self._send_face(
-                registration=reg,
-                name=name,
-                jpeg_path=jpeg_path,
-                device_user_id=device_id,
-                face_public_url=face_public_url,
-            )
+            if self._add_via_panel(name, reg, jpeg_path):
+                # Como o painel: usuário e foto num pedido só, e o facial escolhe o FaceID.
+                user = self._wait_for_user(reg)
+                device_id = int(user["ID"])
+                face_ok = self._face_confirmed(reg, retries=PANEL_CONFIRM_RETRIES, name=name)
+            else:
+                user = self._add_plain_user(name, reg)
+                device_id = int(user["ID"])
+                face_ok = self._send_face(
+                    registration=reg,
+                    name=name,
+                    jpeg_path=jpeg_path,
+                    device_user_id=device_id,
+                    face_public_url=face_public_url,
+                )
         except FaceIDConflict:
             try:
                 self.delete_user(registration=reg)
@@ -889,6 +951,10 @@ class IntelbrasClient:
         existing = self.find_user_by_registration(registration)
         if existing and self.face_shared_with(registration):
             existing = self._drop_shared_face(registration, name)
+        if existing and registration_fits_panel(registration) and self._has_panel():
+            # Foto nova pelo user/set cai no FaceID do último cadastrado: recria pelo painel.
+            self.delete_user(registration=registration)
+            existing = None
         if existing:
             device_id = int(existing["ID"])
             face_ok = self._send_face(
@@ -959,6 +1025,17 @@ class IntelbrasClient:
                     f"{self.base_url}, e a foto salva não está neste PC. Envie uma foto nova pelo botão Foto."
                 )
             existing = self._drop_shared_face(registration, name)
+        if (
+            existing
+            and image_path
+            and Path(image_path).exists()
+            and not self._face_signature(registration)
+            and registration_fits_panel(registration)
+            and self._has_panel()
+        ):
+            # Sem rosto no facial: o reenvio pelo user/set repetiria o FaceID, então recria pelo painel.
+            self.delete_user(registration=registration)
+            existing = None
         if existing:
             device_id = int(existing["ID"])
             face_ok = True
@@ -1254,6 +1331,10 @@ def _int_or_none(value: object) -> Optional[int]:
         return int(value)  # type: ignore[arg-type]
     except (TypeError, ValueError):
         return None
+
+
+def registration_fits_panel(registration: object) -> bool:
+    return intelbras_fcgi.registration_fits(str(registration or ""))
 
 
 def _clean_face_id(value: object) -> str:

@@ -912,9 +912,13 @@
         if (d.current) text += ` (${d.current})`;
         return text;
       });
+      const stopped = state.error || (state.devices || []).some((d) => d.error);
       resetStatus.textContent = state.running
         ? "Refazendo... não feche o programa. " + lines.join(" · ")
-        : (state.error ? "Parou: " + state.error : "Terminado. " + lines.join(" · ") + ". Rode \"Conferir fotos no Intelbras\" para ver como ficou.");
+        : stopped
+          ? "Parou antes do fim. " + lines.join(" · ") + ". Veja abaixo o motivo e quem ficou sem cadastro."
+          : "Terminado. " + lines.join(" · ") + ". Rode \"Conferir fotos no Intelbras\" para ver como ficou.";
+      if (!state.running && state.error) addList("Parou", [state.error]);
       if (state.running) return;
       for (const d of state.devices || []) {
         if (d.error) addList(`${d.label}: parou`, [d.error]);

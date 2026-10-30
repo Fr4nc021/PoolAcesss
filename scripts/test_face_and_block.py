@@ -141,6 +141,10 @@ class FakeClient(ic.IntelbrasClient):
     def _client(self) -> httpx.Client:
         return httpx.Client(transport=httpx.MockTransport(self.device.handler), auth=("admin", ""))
 
+    def _panel_http(self) -> httpx.Client:
+        # Facial de mentira sem /fcgi responde 404: o cadastro segue pela API.
+        return httpx.Client(transport=httpx.MockTransport(self.device.handler), follow_redirects=True)
+
 
 def _photo(path: Path, *, size=(480, 640), fmt="JPEG", exif_rotate: bool = False) -> Path:
     img = Image.new("RGB", size, (190, 160, 140))

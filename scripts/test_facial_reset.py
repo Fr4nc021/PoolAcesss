@@ -146,7 +146,7 @@ def test_reset_stops_on_repeated_face(tmp: Path) -> None:
 
 
 def main() -> None:
-    with tempfile.TemporaryDirectory() as tmp:
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
         root = Path(tmp)
         test_reset_rebuilds_the_facial(root)
         test_reset_stops_on_repeated_face(root)
