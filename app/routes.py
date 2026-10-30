@@ -652,7 +652,11 @@ def adm_conferir_fotos():
     """Passa sócio a sócio comparando o banco deste PC com o que cada facial guardou."""
     from app.face_audit import run_audit
 
-    return jsonify(run_audit())
+    try:
+        return jsonify(run_audit())
+    except Exception as exc:  # noqa: BLE001 — a tela mostra o erro em vez de quebrar
+        logger.exception("Conferência das fotos falhou")
+        return jsonify({"ok": False, "error": f"Falha na conferência: {exc}"}), 500
 
 
 @bp.post("/adm/corrigir-fotos")
