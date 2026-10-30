@@ -10,6 +10,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import re
 import sys
 import tarfile
 import tempfile
@@ -35,6 +36,12 @@ import app.expiry as expiry
 import app.intelbras_client as ic
 
 time.sleep = lambda _seconds: None  # noqa: E731 — sem esperas no teste
+
+
+def _post_decode(text: str) -> str:
+    """O inverso do PostEncode, como o facial lê o texto."""
+    codes = {"A": "`", "B": "&", "C": "=", "D": " ", "E": "\r\n", "F": "'", "G": "%", "H": "/", "I": "$", "J": "#", "K": "+"}
+    return re.sub(r"`([A-K])", lambda m: codes[m.group(1)], text)
 
 
 class FakeDevice:
@@ -72,7 +79,6 @@ class FakeDevice:
     def _panel(self, request: httpx.Request) -> httpx.Response:
         """O /fcgi do painel: login por cookie e usuário + foto num POST multipart."""
         import re
-        from urllib.parse import unquote
 
         params = request.url.params
         cookie = request.headers.get("cookie", "")
@@ -96,7 +102,7 @@ class FakeDevice:
             self.panel_adds.append(fields)
             uid = str(self.next_id)
             self.next_id += 1
-            user = {"ID": uid, "UserID": unquote(fields[0]), "Name": unquote(fields[1]), "FaceID": "0"}
+            user = {"ID": uid, "UserID": _post_decode(fields[0]), "Name": _post_decode(fields[1]), "FaceID": "0"}
             self.users[uid] = user
             self._enroll(user, jpeg)
             return httpx.Response(200, text="<html>ok</html>")
