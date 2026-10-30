@@ -72,6 +72,20 @@ def test_wrong_password_is_an_error(tmp: Path) -> None:
     assert device._by_userid("AP00000003") is None
 
 
+def test_session_cookie_from_status_page(tmp: Path) -> None:
+    device = _device()
+    client = PanelClient(device)
+    photo = ic.prepare_face_photo(_photo(tmp / "sessao.jpg"))
+    client.create_user_with_face("Caio", photo, registration="AP00000005")
+    assert device.sessions, "a sessão vem do hcSessionIdNow e vira o cookie SessionId"
+
+    thermal = _device()
+    thermal.session_without_login = True
+    client = PanelClient(thermal)
+    client.create_user_with_face("Duda", photo, registration="AP00000006")
+    assert thermal._by_userid("AP00000006"), "abre a sessão também sem usuário e senha no SubmitData"
+
+
 def test_long_registration_is_refused(tmp: Path) -> None:
     device = _device()
     client = PanelClient(device)
@@ -190,6 +204,7 @@ def main() -> None:
         root = Path(tmp)
         test_panel_gives_each_face_its_own_number(root)
         test_wrong_password_is_an_error(root)
+        test_session_cookie_from_status_page(root)
         test_long_registration_is_refused(root)
         test_photo_change_recreates_through_panel(root)
         test_reset_completes_through_panel(root)

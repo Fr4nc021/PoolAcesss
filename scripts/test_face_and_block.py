@@ -60,6 +60,9 @@ class FakeDevice:
         self.panel_password = ""
         self.faces_ok = True  # False: o facial guarda a foto mas não gera o modelo do rosto
         self.panel_adds: list[list[str]] = []
+        self.sessions: list[str] = []
+        # True: abre a sessão só sem usuário e senha no SubmitData (como parece a térmica).
+        self.session_without_login = False
 
     def _by_userid(self, user_id: str):
         return next((u for u in self.users.values() if u["UserID"] == user_id), None)
@@ -79,16 +82,32 @@ class FakeDevice:
     def _panel(self, request: httpx.Request) -> httpx.Response:
         """O /fcgi do painel: login por cookie e usuário + foto num POST multipart."""
         import re
+        from urllib.parse import unquote_plus
 
         params = request.url.params
         cookie = request.headers.get("cookie", "")
-        logged = f"Password=enc-{self.panel_password}" in cookie and "UserName=admin" in cookie
+        logged = bool(self.sessions) and any(f"SessionId={sid}" in cookie for sid in self.sessions)
         if params.get("action") == "Encrypt":
             ok = params.get("UserName") == "admin" and params.get("Password") == self.panel_password
             value = f"enc-{self.panel_password}" if ok else "-1"
             return httpx.Response(200, text=f"<form name='hiddenValForm_Div'> <input id=hcSingleResult type=hidden value='{value}'> </form>")
         if params.get_list("id") == ["1"]:
-            return httpx.Response(200, text=f"<input id=hcLoginStatus type=hidden value='{1 if logged else -1}'>")
+            # Como o facial: a página de Status com o número da sessão escondido,
+            # ou a tela de login de novo (com o hcLoginStatus) se a senha não bate.
+            form = dict(part.split("=", 1) for part in request.read().decode().split("&") if "=" in part)
+            submit = unquote_plus(form.get("SubmitData", ""))
+            with_login = f"Password=enc-{self.panel_password}" in submit and "UserName=admin" in submit
+            if with_login if not self.session_without_login else "UserName=" not in submit:
+                sid = f"S{len(self.sessions) + 1:04d}"
+                self.sessions.append(sid)
+                return httpx.Response(
+                    200,
+                    text=(
+                        "<html><input id=hcLoginStatus type=hidden value='-1'>"
+                        f"<form name='hiddenValForm'><input id=\"hcSessionIdNow\" type=\"hidden\" value=\"{sid}\"></form></html>"
+                    ),
+                )
+            return httpx.Response(200, text="<html><input id=hcLoginStatus type=hidden value='-1'></html>")
         if params.get_list("id") == ["16", "5"]:
             assert logged, "cadastro sem a sessão do painel"
             body = request.read()
