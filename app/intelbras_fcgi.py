@@ -8,8 +8,9 @@ limpos e reiniciados. O painel, que dá FaceIDs diferentes, faz outro caminho
 
 1. GET /fcgi/do?action=Encrypt&UserName=..&Password=..: o facial devolve a
    senha criptografada no campo hcSingleResult;
-2. grava UserName e a senha criptografada como cookies e cria a sessão com
-   POST /fcgi/do?id=1 (Operation=CreateSession);
+2. cria a sessão com POST /fcgi/do?id=1 (Operation=CreateSession, com usuário
+   e senha criptografada no SubmitData). A página que volta traz o número da
+   sessão em hcSessionIdNow, que vira o cookie SessionId;
 3. cria o usuário JUNTO com a foto num único POST multipart para
    /fcgi/do?id=16&id=5, com DestUpFile=UserDataUploadAndCommit e os dados
    cUserAdd=<UserID>/<Nome>/<PIN>/<Andar>/<Cartões>/<Relé>/<WebRelay>/<Validade>/<FaceID>/.
@@ -21,17 +22,12 @@ from __future__ import annotations
 import random
 import re
 import time
+from typing import Optional
+
 import httpx
 
 # Limite que o painel aplica à matrícula.
 PANEL_REGISTRATION = re.compile(r"[0-9A-Za-z]{1,11}")
-# O facial escreve sem aspas no id e com aspas simples no valor:
-# <input id=hcSingleResult type=hidden value='c14f...'>. Aceita os dois jeitos.
-_Q = "[\"']?"
-_SINGLE_RESULT = (
-    re.compile(rf"id={_Q}hcSingleResult{_Q}[^>]*value={_Q}([^\"'\s>]*)"),
-    re.compile(rf"value={_Q}([^\"'\s>]*){_Q}[^>]*id={_Q}hcSingleResult\b"),
-)
 
 
 # Mesma troca que o PostEncode do painel (js/common.js do facial). O facial lê
@@ -61,12 +57,16 @@ def registration_fits(registration: str) -> bool:
     return bool(PANEL_REGISTRATION.fullmatch(str(registration or "")))
 
 
-def _encrypted_password(text: str) -> str:
-    for pattern in _SINGLE_RESULT:
-        match = pattern.search(text)
-        if match:
-            return match.group(1)
-    return ""
+def _hidden(text: str, field: str) -> Optional[str]:
+    """Valor de um <input id=field ... value=...> escondido; None se não houver.
+
+    O facial escreve sem aspas no id e com aspas simples no valor
+    (<input id=hcSingleResult type=hidden value='c14f...'>); aceita os dois jeitos.
+    """
+    match = re.search(
+        rf"<input[^>]*\bid=[\"']?{re.escape(field)}[\"']?[^>]*\bvalue=([\"']?)([^\"'\s>]*)\1", text or ""
+    )
+    return match.group(2) if match else None
 
 
 def _answer(text: str, password: str) -> str:
@@ -86,7 +86,7 @@ def login(http: httpx.Client, base_url: str, user: str, password: str) -> None:
     if response.status_code == 404:
         raise PanelUnavailable(f"{base_url} não tem /fcgi")
     response.raise_for_status()
-    encrypted = _encrypted_password(response.text)
+    encrypted = _hidden(response.text, "hcSingleResult") or ""
     if not encrypted or encrypted == "-1":
         if "hcSingleResult" not in response.text:
             raise PanelUnavailable(
@@ -96,17 +96,32 @@ def login(http: httpx.Client, base_url: str, user: str, password: str) -> None:
             "O facial recusou o usuário ou a senha (login do painel). "
             f"Resposta: {_answer(response.text, password)}"
         )
-    # Sem domínio, o cookie vai para este facial seja ele IP ou nome; o http é só desta sessão.
-    http.cookies.set("UserName", post_encode(user))
-    http.cookies.set("Password", encrypted)
-    response = http.post(
-        f"{base_url}/fcgi/do?id=1",
-        data={"SubmitData": "begin&Operation=CreateSession&DestURL=id=1&SubmitData=end"},
+    # Como o OnLogin do painel: usuário e senha criptografada vão no SubmitData
+    # (o painel guarda os dois no localStorage, não em cookie). A página que volta
+    # traz o número da sessão em hcSessionIdNow, que o JavaScript grava no cookie
+    # SessionId; daí em diante só esse cookie vale como login. A térmica
+    # (216.57.0.90) parece abrir a sessão sem usuário e senha: tenta os dois.
+    forms = (
+        f"begin&Operation=CreateSession&DestURL=id`C1&UserName={user.strip()}&Password={encrypted}&SubmitData=end",
+        "begin&Operation=CreateSession&DestURL=id`C1&SubmitData=end",
     )
-    # A resposta é a página inteira do painel, que já traz um hcLoginStatus -1
-    # de modelo: não dá para julgar a sessão por ela. Quem confere é o cadastro
-    # (a pessoa tem que aparecer na lista do facial).
-    response.raise_for_status()
+    session_id = None
+    for form in forms:
+        response = http.post(f"{base_url}/fcgi/do?id=1", data={"SubmitData": form})
+        response.raise_for_status()
+        session_id = _hidden(response.text, "hcSessionIdNow")
+        if session_id:
+            break
+    if not session_id:
+        status = _hidden(response.text, "hcLoginStatus")
+        if status == "-2":
+            raise PanelError("O facial bloqueou o login do painel por tentativas demais. Espere alguns minutos.")
+        raise PanelError(
+            "O facial não abriu a sessão do painel (sem hcSessionIdNow). "
+            f"Resposta: {_answer(response.text, encrypted)}"
+        )
+    # Sem domínio, o cookie vai para este facial seja ele IP ou nome; o http é só desta sessão.
+    http.cookies.set("SessionId", session_id, path="/")
 
 
 def add_user_with_face(
@@ -128,6 +143,7 @@ def add_user_with_face(
         f"{base_url}/fcgi/do?id=16&id=5&RefRand={random.randint(10, 100000010)}",
         data={"uploadType": f"&Operation=Upload&DestUpFile=UserDataUploadAndCommit/{fields}&"},
         files={"importUserFacePhoto": ("foto.jpg", jpeg, "image/jpeg")},
+        headers={"Referer": f"{base_url}/fcgi/do?id=16&id=5", "Origin": base_url},
     )
     response.raise_for_status()
     return _answer(response.text, "")

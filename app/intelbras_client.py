@@ -335,11 +335,11 @@ class IntelbrasClient:
             raise DeviceError(f"Falha no login do painel do facial {self.base_url}: {exc}") from exc
 
     def _wait_for_user(self, registration: str) -> dict[str, Any]:
-        for attempt in range(FACE_CONFIRM_RETRIES):
+        for attempt in range(PANEL_CONFIRM_RETRIES):
             user = self.find_user_by_registration(registration)
             if user:
                 return user
-            if attempt + 1 < FACE_CONFIRM_RETRIES:
+            if attempt + 1 < PANEL_CONFIRM_RETRIES:
                 time.sleep(FACE_CONFIRM_DELAY)
         raise DeviceError(
             f"O facial {self.base_url} recebeu o cadastro de {registration}, mas ele não apareceu na lista. "
