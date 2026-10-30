@@ -61,8 +61,10 @@ class FakeDevice:
         self.faces_ok = True  # False: o facial guarda a foto mas não gera o modelo do rosto
         self.panel_adds: list[list[str]] = []
         self.sessions: list[str] = []
-        # True: abre a sessão só sem usuário e senha no SubmitData (como parece a térmica).
+        # True: como a térmica, usuário e senha vão nos cookies e não no SubmitData.
         self.session_without_login = False
+        # True: manda o SessionId no Set-Cookie, sem o campo hcSessionIdNow na página.
+        self.session_in_header = False
 
     def _by_userid(self, user_id: str):
         return next((u for u in self.users.values() if u["UserID"] == user_id), None)
@@ -96,10 +98,24 @@ class FakeDevice:
             # ou a tela de login de novo (com o hcLoginStatus) se a senha não bate.
             form = dict(part.split("=", 1) for part in request.read().decode().split("&") if "=" in part)
             submit = unquote_plus(form.get("SubmitData", ""))
-            with_login = f"Password=enc-{self.panel_password}" in submit and "UserName=admin" in submit
-            if with_login if not self.session_without_login else "UserName=" not in submit:
+            if self.session_without_login:
+                # Térmica: SubmitData sem usuário e senha; os dois vêm nos cookies.
+                ok = (
+                    "UserName=" not in submit
+                    and f"Password=enc-{self.panel_password}" in cookie
+                    and "UserName=admin" in cookie
+                )
+            else:
+                ok = f"Password=enc-{self.panel_password}" in submit and "UserName=admin" in submit
+            if ok:
                 sid = f"S{len(self.sessions) + 1:04d}"
                 self.sessions.append(sid)
+                if self.session_in_header:
+                    return httpx.Response(
+                        200,
+                        headers={"Set-Cookie": f"SessionId={sid}; path=/"},
+                        text="<html><input id=hcLoginStatus type=hidden value='-1'></html>",
+                    )
                 return httpx.Response(
                     200,
                     text=(

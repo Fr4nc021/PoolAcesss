@@ -17,6 +17,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import httpx
+
 from test_face_id_conflict import PhotoDevice  # noqa: E402 — monta o ambiente de teste
 from test_face_and_block import FakeClient, _photo  # noqa: E402
 
@@ -83,7 +85,33 @@ def test_session_cookie_from_status_page(tmp: Path) -> None:
     thermal.session_without_login = True
     client = PanelClient(thermal)
     client.create_user_with_face("Duda", photo, registration="AP00000006")
-    assert thermal._by_userid("AP00000006"), "abre a sessão também sem usuário e senha no SubmitData"
+    assert thermal._by_userid("AP00000006"), "térmica: usuário e senha nos cookies, sem eles no SubmitData"
+
+    header = _device()
+    header.session_in_header = True
+    client = PanelClient(header)
+    client.create_user_with_face("Eva", photo, registration="AP00000007")
+    assert header._by_userid("AP00000007"), "aceita o SessionId mandado no Set-Cookie"
+
+    broken = _device()
+    broken.session_without_login = True
+    broken.panel_password = PASSWORD
+    client = PanelClient(broken)
+    original = broken._panel
+
+    def no_session(request):
+        response = original(request)
+        if request.url.params.get_list("id") == ["1"]:
+            return httpx.Response(200, text="<html><title>XPE</title><input id=hcLoginStatus value='1'><input id=hcOther value='x'></html>")
+        return response
+
+    broken._panel = no_session
+    try:
+        client.create_user_with_face("Fia", photo, registration="AP00000008")
+    except ic.DeviceError as exc:
+        assert "hcOther" in str(exc) and "título XPE" in str(exc), exc
+    else:
+        raise AssertionError("sem sessão não pode cadastrar")
 
 
 def test_long_registration_is_refused(tmp: Path) -> None:

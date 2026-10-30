@@ -69,6 +69,29 @@ def _hidden(text: str, field: str) -> Optional[str]:
     return match.group(2) if match else None
 
 
+def _session_in_page(text: str) -> Optional[str]:
+    """Número da sessão na página do CreateSession: hcSessionIdNow ou outro campo de sessão."""
+    value = _hidden(text, "hcSessionIdNow")
+    if value:
+        return value
+    for match in re.finditer(r"<input[^>]*\bid=[\"']?(\w*session\w*)[\"']?", text or "", re.I):
+        value = _hidden(text, match.group(1))
+        if value:
+            return value
+    return None
+
+
+def _page_summary(text: str, http: httpx.Client) -> str:
+    """O que a página do CreateSession trouxe, sem valores: ajuda a ver o que mudou no firmware."""
+    title = re.search(r"<title>(.*?)</title>", text or "", re.I | re.S)
+    ids = sorted(set(re.findall(r"<input[^>]*\bid=[\"']?(\w+)", text or "")))
+    status = _hidden(text, "hcLoginStatus")
+    return (
+        f"título {title.group(1).strip() if title else '?'}; hcLoginStatus {status if status is not None else 'ausente'}; "
+        f"campos {', '.join(ids[:25]) or 'nenhum'}; cookies {', '.join(sorted(http.cookies.keys())) or 'nenhum'}"
+    )
+
+
 def _answer(text: str, password: str) -> str:
     """Começo da resposta do facial, sem a senha, para o erro mostrar o que ele disse."""
     clean = re.sub(r"\s+", " ", text or "").strip()
@@ -96,29 +119,44 @@ def login(http: httpx.Client, base_url: str, user: str, password: str) -> None:
             "O facial recusou o usuário ou a senha (login do painel). "
             f"Resposta: {_answer(response.text, password)}"
         )
-    # Como o OnLogin do painel: usuário e senha criptografada vão no SubmitData
-    # (o painel guarda os dois no localStorage, não em cookie). A página que volta
-    # traz o número da sessão em hcSessionIdNow, que o JavaScript grava no cookie
-    # SessionId; daí em diante só esse cookie vale como login. A térmica
-    # (216.57.0.90) parece abrir a sessão sem usuário e senha: tenta os dois.
-    forms = (
-        f"begin&Operation=CreateSession&DestURL=id`C1&UserName={user.strip()}&Password={encrypted}&SubmitData=end",
-        "begin&Operation=CreateSession&DestURL=id`C1&SubmitData=end",
+    # Os dois firmwares do clube abrem a sessão de jeitos diferentes (lido no
+    # OnLogin e no cookieProcess.js de cada um):
+    # - normal (216.57.1.13): usuário e senha criptografada vão dentro do
+    #   SubmitData; o painel guarda os dois no localStorage, não em cookie;
+    # - térmica (216.57.0.90): SubmitData sem usuário e senha; os dois vão nos
+    #   cookies UserName e Password, que o painel grava por 2 segundos.
+    # A página que volta traz o número da sessão em hcSessionIdNow, que vira o
+    # cookie SessionId; daí em diante só esse cookie vale como login.
+    attempts = (
+        (f"begin&Operation=CreateSession&DestURL=id`C1&UserName={user.strip()}&Password={encrypted}&SubmitData=end", False),
+        ("begin&Operation=CreateSession&DestURL=id`C1&SubmitData=end", True),
     )
     session_id = None
-    for form in forms:
+    for form, in_cookies in attempts:
+        if in_cookies:
+            http.cookies.set("UserName", user.strip(), path="/")
+            http.cookies.set("Password", encrypted, path="/")
         response = http.post(f"{base_url}/fcgi/do?id=1", data={"SubmitData": form})
+        for name in ("UserName", "Password"):
+            # Como no painel, que deixa esses dois expirarem logo depois.
+            try:
+                http.cookies.delete(name)
+            except KeyError:
+                pass
         response.raise_for_status()
-        session_id = _hidden(response.text, "hcSessionIdNow")
-        if session_id:
+        session_id = _session_in_page(response.text)
+        if session_id or http.cookies.get("SessionId"):
             break
+    if not session_id and http.cookies.get("SessionId"):
+        # O facial já mandou o cookie de sessão no cabeçalho (Set-Cookie).
+        return
     if not session_id:
         status = _hidden(response.text, "hcLoginStatus")
         if status == "-2":
             raise PanelError("O facial bloqueou o login do painel por tentativas demais. Espere alguns minutos.")
         raise PanelError(
             "O facial não abriu a sessão do painel (sem hcSessionIdNow). "
-            f"Resposta: {_answer(response.text, encrypted)}"
+            f"Página: {_page_summary(response.text, http)}"
         )
     # Sem domínio, o cookie vai para este facial seja ele IP ou nome; o http é só desta sessão.
     http.cookies.set("SessionId", session_id, path="/")
