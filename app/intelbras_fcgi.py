@@ -21,16 +21,33 @@ from __future__ import annotations
 import random
 import re
 import time
-from urllib.parse import quote
-
 import httpx
 
 # Limite que o painel aplica à matrícula.
 PANEL_REGISTRATION = re.compile(r"[0-9A-Za-z]{1,11}")
+# O facial escreve sem aspas no id e com aspas simples no valor:
+# <input id=hcSingleResult type=hidden value='c14f...'>. Aceita os dois jeitos.
+_Q = "[\"']?"
 _SINGLE_RESULT = (
-    re.compile(r'id="hcSingleResult"[^>]*value="([^"]*)"'),
-    re.compile(r'value="([^"]*)"[^>]*id="hcSingleResult"'),
+    re.compile(rf"id={_Q}hcSingleResult{_Q}[^>]*value={_Q}([^\"'\s>]*)"),
+    re.compile(rf"value={_Q}([^\"'\s>]*){_Q}[^>]*id={_Q}hcSingleResult\b"),
 )
+_LOGIN_FAILED = re.compile(rf"id={_Q}hcLoginStatus{_Q}[^>]*value={_Q}-1\b|value={_Q}-1{_Q}[^>]*id={_Q}hcLoginStatus\b")
+
+
+# Mesma troca que o PostEncode do painel (js/common.js do facial). O facial lê
+# os textos assim, não com a codificação de URL. A crase vem primeiro, para
+# não estragar os códigos `A..`K que entram depois.
+_POST_ENCODE = (
+    ("`", "`A"), ("&", "`B"), ("=", "`C"), (" ", "`D"), ("\r\n", "`E"), ("'", "`F"),
+    ("%", "`G"), ("/", "`H"), ("$", "`I"), ("#", "`J"), ("+", "`K"),
+)
+
+
+def post_encode(text: str) -> str:
+    for plain, code in _POST_ENCODE:
+        text = text.replace(plain, code)
+    return text
 
 
 class PanelUnavailable(Exception):
@@ -65,7 +82,7 @@ def login(http: httpx.Client, base_url: str, user: str, password: str) -> None:
     """Abre a sessão do painel no http (cookies), como o login da tela do Intelbras."""
     response = http.get(
         f"{base_url}/fcgi/do",
-        params={"action": "Encrypt", "UserName": user, "Password": password, "_": int(time.time() * 1000)},
+        params={"action": "Encrypt", "UserName": post_encode(user), "Password": post_encode(password), "_": int(time.time() * 1000)},
     )
     if response.status_code == 404:
         raise PanelUnavailable(f"{base_url} não tem /fcgi")
@@ -81,14 +98,14 @@ def login(http: httpx.Client, base_url: str, user: str, password: str) -> None:
             f"Resposta: {_answer(response.text, password)}"
         )
     # Sem domínio, o cookie vai para este facial seja ele IP ou nome; o http é só desta sessão.
-    http.cookies.set("UserName", user)
+    http.cookies.set("UserName", post_encode(user))
     http.cookies.set("Password", encrypted)
     response = http.post(
         f"{base_url}/fcgi/do?id=1",
         data={"SubmitData": "begin&Operation=CreateSession&DestURL=id=1&SubmitData=end"},
     )
     response.raise_for_status()
-    if 'id="hcLoginStatus"' in response.text and 'value="-1"' in response.text:
+    if _LOGIN_FAILED.search(response.text):
         raise PanelError(
             f"O facial recusou a sessão do painel (CreateSession). Resposta: {_answer(response.text, password)}"
         )
@@ -107,8 +124,8 @@ def add_user_with_face(
     """O mesmo pedido do botão Salvar do painel ao criar um usuário com foto."""
     if not registration_fits(registration):
         raise PanelError("Matrícula precisa ter só letras e números, até 11 caracteres.")
-    # Barra separa os campos: no nome ela também vai codificada.
-    fields = f"cUserAdd={quote(registration, safe='')}/{quote(name.strip()[:60], safe='')}//0//{relay}//{validity}/0/"
+    # Barra separa os campos: no nome ela vai codificada pelo PostEncode, como no painel.
+    fields = f"cUserAdd={post_encode(registration)}/{post_encode(name.strip()[:60])}//0//{relay}//{validity}/0/"
     response = http.post(
         f"{base_url}/fcgi/do?id=16&id=5&RefRand={random.randint(10, 100000010)}",
         data={"uploadType": f"&Operation=Upload&DestUpFile=UserDataUploadAndCommit/{fields}&"},
