@@ -63,6 +63,8 @@ class FakeDevice:
         self.sessions: list[str] = []
         # True: abre a sessão só sem usuário e senha no SubmitData (como parece a térmica).
         self.session_without_login = False
+        # True: manda o SessionId no Set-Cookie, sem o campo hcSessionIdNow na página.
+        self.session_in_header = False
 
     def _by_userid(self, user_id: str):
         return next((u for u in self.users.values() if u["UserID"] == user_id), None)
@@ -100,6 +102,12 @@ class FakeDevice:
             if with_login if not self.session_without_login else "UserName=" not in submit:
                 sid = f"S{len(self.sessions) + 1:04d}"
                 self.sessions.append(sid)
+                if self.session_in_header:
+                    return httpx.Response(
+                        200,
+                        headers={"Set-Cookie": f"SessionId={sid}; path=/"},
+                        text="<html><input id=hcLoginStatus type=hidden value='-1'></html>",
+                    )
                 return httpx.Response(
                     200,
                     text=(

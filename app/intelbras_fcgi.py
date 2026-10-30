@@ -69,6 +69,29 @@ def _hidden(text: str, field: str) -> Optional[str]:
     return match.group(2) if match else None
 
 
+def _session_in_page(text: str) -> Optional[str]:
+    """Número da sessão na página do CreateSession: hcSessionIdNow ou outro campo de sessão."""
+    value = _hidden(text, "hcSessionIdNow")
+    if value:
+        return value
+    for match in re.finditer(r"<input[^>]*\bid=[\"']?(\w*session\w*)[\"']?", text or "", re.I):
+        value = _hidden(text, match.group(1))
+        if value:
+            return value
+    return None
+
+
+def _page_summary(text: str, http: httpx.Client) -> str:
+    """O que a página do CreateSession trouxe, sem valores: ajuda a ver o que mudou no firmware."""
+    title = re.search(r"<title>(.*?)</title>", text or "", re.I | re.S)
+    ids = sorted(set(re.findall(r"<input[^>]*\bid=[\"']?(\w+)", text or "")))
+    status = _hidden(text, "hcLoginStatus")
+    return (
+        f"título {title.group(1).strip() if title else '?'}; hcLoginStatus {status if status is not None else 'ausente'}; "
+        f"campos {', '.join(ids[:25]) or 'nenhum'}; cookies {', '.join(sorted(http.cookies.keys())) or 'nenhum'}"
+    )
+
+
 def _answer(text: str, password: str) -> str:
     """Começo da resposta do facial, sem a senha, para o erro mostrar o que ele disse."""
     clean = re.sub(r"\s+", " ", text or "").strip()
@@ -109,16 +132,19 @@ def login(http: httpx.Client, base_url: str, user: str, password: str) -> None:
     for form in forms:
         response = http.post(f"{base_url}/fcgi/do?id=1", data={"SubmitData": form})
         response.raise_for_status()
-        session_id = _hidden(response.text, "hcSessionIdNow")
-        if session_id:
+        session_id = _session_in_page(response.text)
+        if session_id or http.cookies.get("SessionId"):
             break
+    if not session_id and http.cookies.get("SessionId"):
+        # O facial já mandou o cookie de sessão no cabeçalho (Set-Cookie).
+        return
     if not session_id:
         status = _hidden(response.text, "hcLoginStatus")
         if status == "-2":
             raise PanelError("O facial bloqueou o login do painel por tentativas demais. Espere alguns minutos.")
         raise PanelError(
             "O facial não abriu a sessão do painel (sem hcSessionIdNow). "
-            f"Resposta: {_answer(response.text, encrypted)}"
+            f"Página: {_page_summary(response.text, http)}"
         )
     # Sem domínio, o cookie vai para este facial seja ele IP ou nome; o http é só desta sessão.
     http.cookies.set("SessionId", session_id, path="/")
