@@ -119,18 +119,30 @@ def login(http: httpx.Client, base_url: str, user: str, password: str) -> None:
             "O facial recusou o usuário ou a senha (login do painel). "
             f"Resposta: {_answer(response.text, password)}"
         )
-    # Como o OnLogin do painel: usuário e senha criptografada vão no SubmitData
-    # (o painel guarda os dois no localStorage, não em cookie). A página que volta
-    # traz o número da sessão em hcSessionIdNow, que o JavaScript grava no cookie
-    # SessionId; daí em diante só esse cookie vale como login. A térmica
-    # (216.57.0.90) parece abrir a sessão sem usuário e senha: tenta os dois.
-    forms = (
-        f"begin&Operation=CreateSession&DestURL=id`C1&UserName={user.strip()}&Password={encrypted}&SubmitData=end",
-        "begin&Operation=CreateSession&DestURL=id`C1&SubmitData=end",
+    # Os dois firmwares do clube abrem a sessão de jeitos diferentes (lido no
+    # OnLogin e no cookieProcess.js de cada um):
+    # - normal (216.57.1.13): usuário e senha criptografada vão dentro do
+    #   SubmitData; o painel guarda os dois no localStorage, não em cookie;
+    # - térmica (216.57.0.90): SubmitData sem usuário e senha; os dois vão nos
+    #   cookies UserName e Password, que o painel grava por 2 segundos.
+    # A página que volta traz o número da sessão em hcSessionIdNow, que vira o
+    # cookie SessionId; daí em diante só esse cookie vale como login.
+    attempts = (
+        (f"begin&Operation=CreateSession&DestURL=id`C1&UserName={user.strip()}&Password={encrypted}&SubmitData=end", False),
+        ("begin&Operation=CreateSession&DestURL=id`C1&SubmitData=end", True),
     )
     session_id = None
-    for form in forms:
+    for form, in_cookies in attempts:
+        if in_cookies:
+            http.cookies.set("UserName", user.strip(), path="/")
+            http.cookies.set("Password", encrypted, path="/")
         response = http.post(f"{base_url}/fcgi/do?id=1", data={"SubmitData": form})
+        for name in ("UserName", "Password"):
+            # Como no painel, que deixa esses dois expirarem logo depois.
+            try:
+                http.cookies.delete(name)
+            except KeyError:
+                pass
         response.raise_for_status()
         session_id = _session_in_page(response.text)
         if session_id or http.cookies.get("SessionId"):

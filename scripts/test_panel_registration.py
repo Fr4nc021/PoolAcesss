@@ -85,7 +85,7 @@ def test_session_cookie_from_status_page(tmp: Path) -> None:
     thermal.session_without_login = True
     client = PanelClient(thermal)
     client.create_user_with_face("Duda", photo, registration="AP00000006")
-    assert thermal._by_userid("AP00000006"), "abre a sessão também sem usuário e senha no SubmitData"
+    assert thermal._by_userid("AP00000006"), "térmica: usuário e senha nos cookies, sem eles no SubmitData"
 
     header = _device()
     header.session_in_header = True
