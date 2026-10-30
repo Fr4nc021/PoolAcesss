@@ -1,4 +1,4 @@
-"""Testa envio de foto, confirmação do rosto e exclusão contra um facial de mentira.
+"""Testa cadastro pelo painel, confirmação do rosto e exclusão contra um facial de mentira.
 
 O facial de mentira imita o que o export real mostra: quem é reconhecido
 tem a pasta faceIDs/<FaceID>-<nome>/ com o modelo do rosto. Uma foto que
@@ -50,6 +50,9 @@ class FakeDevice:
         self.delete_works = True
         self.online = True
         self.served_photos: dict[str, bytes] = {}
+        self.panel_password = ""
+        self.faces_ok = True  # False: o facial guarda a foto mas não gera o modelo do rosto
+        self.panel_adds: list[list[str]] = []
 
     def _by_userid(self, user_id: str):
         return next((u for u in self.users.values() if u["UserID"] == user_id), None)
@@ -62,12 +65,49 @@ class FakeDevice:
                 img.load()
         except Exception:  # noqa: BLE001 — foto ruim: fica FaceID sem modelo
             return
+        if not self.faces_ok:
+            return
         self.templates[user["FaceID"]] = b"modelo:" + jpeg[-64:]
+
+    def _panel(self, request: httpx.Request) -> httpx.Response:
+        """O /fcgi do painel: login por cookie e usuário + foto num POST multipart."""
+        import re
+        from urllib.parse import unquote
+
+        params = request.url.params
+        cookie = request.headers.get("cookie", "")
+        logged = f"Password=enc-{self.panel_password}" in cookie and "UserName=admin" in cookie
+        if params.get("action") == "Encrypt":
+            ok = params.get("UserName") == "admin" and params.get("Password") == self.panel_password
+            value = f"enc-{self.panel_password}" if ok else "-1"
+            return httpx.Response(200, text=f'<input type="hidden" id="hcSingleResult" value="{value}">')
+        if params.get_list("id") == ["1"]:
+            return httpx.Response(200, text=f'<input id="hcLoginStatus" value="{1 if logged else -1}">')
+        if params.get_list("id") == ["16", "5"]:
+            assert logged, "cadastro sem a sessão do painel"
+            body = request.read()
+            upload = re.search(rb'name="uploadType"\r\n\r\n(.*?)\r\n--', body, re.S).group(1).decode()
+            jpeg = re.search(
+                rb'name="importUserFacePhoto"; filename="[^"]*"\r\nContent-Type: image/jpeg\r\n\r\n(.*?)\r\n--',
+                body,
+                re.S,
+            ).group(1)
+            fields = re.search(r"cUserAdd=(.*)/&$", upload).group(1).split("/")
+            self.panel_adds.append(fields)
+            uid = str(self.next_id)
+            self.next_id += 1
+            user = {"ID": uid, "UserID": unquote(fields[0]), "Name": unquote(fields[1]), "FaceID": "0"}
+            self.users[uid] = user
+            self._enroll(user, jpeg)
+            return httpx.Response(200, text="<html>ok</html>")
+        return httpx.Response(404)
 
     def handler(self, request: httpx.Request) -> httpx.Response:
         if not self.online:
             raise httpx.ConnectError("desligado", request=request)
         path = request.url.path
+        if path == "/fcgi/do":
+            return self._panel(request)
         if path == "/api/system/info":
             return httpx.Response(200, json={"retcode": 0, "data": {}})
         if path == "/api/user/get":
@@ -141,6 +181,10 @@ class FakeClient(ic.IntelbrasClient):
     def _client(self) -> httpx.Client:
         return httpx.Client(transport=httpx.MockTransport(self.device.handler), auth=("admin", ""))
 
+    def _panel_http(self) -> httpx.Client:
+        # Facial de mentira sem /fcgi responde 404: o cadastro segue pela API.
+        return httpx.Client(transport=httpx.MockTransport(self.device.handler), follow_redirects=True)
+
 
 def _photo(path: Path, *, size=(480, 640), fmt="JPEG", exif_rotate: bool = False) -> Path:
     img = Image.new("RGB", size, (190, 160, 140))
@@ -159,66 +203,53 @@ def test_registration_needs_face_model(tmp: Path) -> None:
     device = FakeDevice()
     client = FakeClient(device)
     photo = ic.prepare_face_photo(_photo(tmp / "ana.jpg"))
-    url = "http://pc/media/ana.jpg"
 
-    # O PC entrega um arquivo cortado pela FaceUrl e o base64 também: o facial
-    # dá FaceID mas não gera o modelo. Antes isso virava "cadastro ok".
-    device.served_photos[url] = photo.read_bytes()[:500]
-    original_update = client.update_user
-
-    def broken_base64(**kwargs):
-        if kwargs.get("image_path"):
-            kwargs = {**kwargs, "image_path": None, "face_public_url": url}
-        return original_update(**kwargs)
-
-    client.update_user = broken_base64  # type: ignore[method-assign]
+    # O facial guarda a foto mas não gera o modelo do rosto: na porta, "desconhecido".
+    device.faces_ok = False
     try:
-        client.register_member("Ana", photo, registration="R1", face_public_url=url, image_ready=True)
+        client.register_member("Ana", photo, registration="R1", image_ready=True)
     except ic.DeviceError as exc:
         assert str(exc) == ic.FACE_NOT_ACCEPTED_MSG, exc
     else:
         raise AssertionError("foto sem modelo do rosto não pode virar cadastro ok")
     assert device._by_userid("R1") is None, "cadastro incompleto sai do facial"
 
-    client.update_user = original_update  # type: ignore[method-assign]
-    device.served_photos[url] = photo.read_bytes()
-    created = client.register_member("Ana", photo, registration="R1", face_public_url=url, image_ready=True)
+    device.faces_ok = True
+    created = client.register_member("Ana", photo, registration="R1", image_ready=True)
     assert created.face_ok
     user = device._by_userid("R1")
     assert user and user["FaceID"] in device.templates, "modelo do rosto gravado"
+    assert device.panel_adds[-1][:2] == ["R1", "Ana"], "cadastrado pelo painel"
 
 
-def test_new_photo_must_change_model(tmp: Path) -> None:
+def test_new_photo_must_make_a_model(tmp: Path) -> None:
     device = FakeDevice()
     client = FakeClient(device)
     first = ic.prepare_face_photo(_photo(tmp / "bia1.jpg"))
-    url = "http://pc/media/bia1.jpg"
-    device.served_photos[url] = first.read_bytes()
-    client.register_member("Bia", first, registration="R2", face_public_url=url, image_ready=True)
+    client.register_member("Bia", first, registration="R2", image_ready=True)
 
-    # Foto nova que o facial não aceita: o modelo antigo continua lá, mas a troca falhou.
+    # Foto nova que o facial não aceita: a troca falha e não fica cadastro sem rosto.
     second = ic.prepare_face_photo(_photo(tmp / "bia2.jpg", size=(500, 600)))
-    url2 = "http://pc/media/bia2.jpg"
-    device.served_photos[url2] = b"nao e jpeg"
-    client.update_user = lambda **kw: None  # type: ignore[method-assign]
+    device.faces_ok = False
     try:
-        client.update_member_face(name="Bia", registration="R2", image_path=second, face_public_url=url2)
+        client.update_member_face(name="Bia", registration="R2", image_path=second)
     except ic.DeviceError:
         pass
     else:
-        raise AssertionError("modelo antigo não confirma foto nova")
+        raise AssertionError("foto nova sem modelo do rosto não pode virar troca ok")
+    assert device._by_userid("R2") is None
 
 
 def test_renew_keeps_existing_model(tmp: Path) -> None:
     device = FakeDevice()
     client = FakeClient(device)
     photo = ic.prepare_face_photo(_photo(tmp / "caio.jpg"))
-    url = "http://pc/media/caio.jpg"
-    device.served_photos[url] = photo.read_bytes()
-    client.register_member("Caio", photo, registration="R3", face_public_url=url, image_ready=True)
+    client.register_member("Caio", photo, registration="R3", image_ready=True)
     face_before = device._by_userid("R3")["FaceID"]
-    client.renew_member(name="Caio", registration="R3", image_path=photo, face_public_url=url)
+    adds = len(device.panel_adds)
+    client.renew_member(name="Caio", registration="R3", image_path=photo)
     assert device._by_userid("R3")["FaceID"] == face_before, "renovação não reenvia rosto que já vale"
+    assert len(device.panel_adds) == adds
 
 
 def test_delete_is_verified() -> None:
@@ -303,7 +334,7 @@ def main() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
         test_registration_needs_face_model(root)
-        test_new_photo_must_change_model(root)
+        test_new_photo_must_make_a_model(root)
         test_renew_keeps_existing_model(root)
         test_delete_is_verified()
         test_expiry_blocks_reachable_devices(root)

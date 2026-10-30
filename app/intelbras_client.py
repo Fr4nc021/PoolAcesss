@@ -13,10 +13,12 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, Optional
 
 import httpx
 from PIL import Image, ImageOps
+
+from app import intelbras_fcgi
 
 from app.config import (
     DOOR_NUM,
@@ -32,9 +34,10 @@ from app.config import (
 ALWAYS_SCHEDULE_RELAY = f"1001-{DOOR_NUM}"
 # Termo de validade na tela: 0 = Sempre, 1 = Nunca, 2 = Agenda.
 FACE_VALIDITY_ALWAYS = "0"
-FACE_SEND_ROUNDS = 3
 FACE_CONFIRM_RETRIES = 8
 FACE_CONFIRM_DELAY = 1.5
+# Pelo painel o facial leva uns 20 s para gerar o modelo do rosto.
+PANEL_CONFIRM_RETRIES = 20
 FACE_MIN_SIDE = 250
 FACE_MAX_SIDE = 800
 FACE_MIN_BYTES = 1000
@@ -320,108 +323,43 @@ class IntelbrasClient:
                 time.sleep(FACE_CONFIRM_DELAY)
         return False
 
-    def _face_attempts(
-        self,
-        *,
-        registration: str,
-        name: str,
-        jpeg_path: Path,
-        device_user_id: int,
-        face_public_url: Optional[str],
-    ) -> list[tuple[str, Callable[[], None]]]:
-        attempts: list[tuple[str, Callable[[], None]]] = []
-        if face_public_url and face_public_url.startswith("http://"):
-            attempts.append(
-                (
-                    "url",
-                    lambda: self.update_user(
-                        device_user_id=device_user_id,
-                        registration=registration,
-                        name=name,
-                        face_public_url=face_public_url,
-                    ),
-                )
-            )
-            # Nos faciais do clube só o envio por endereço gera o rosto: base64,
-            # RegisterImg e multipart falharam nos dois. Tentar todos deixava cada
-            # cadastro em minutos de espera, então com endereço vai só ele.
-            return attempts
-        # Sem endereço (sem SERVER_LAN_IP) sobram os outros jeitos.
-        # O import do UserData.tgz grava a foto sem gerar o modelo do rosto, então não entra aqui.
-        attempts.extend(
-            [
-                (
-                    "register_img",
-                    lambda: self._send_face_via_register_img(
-                        registration=registration,
-                        name=name,
-                        jpeg_path=jpeg_path,
-                        device_user_id=device_user_id,
-                    ),
-                ),
-                (
-                    "base64",
-                    lambda: self.update_user(
-                        device_user_id=device_user_id,
-                        registration=registration,
-                        name=name,
-                        image_path=jpeg_path,
-                    ),
-                ),
-                (
-                    "base64_data_uri",
-                    lambda: self._send_face_via_data_uri(
-                        device_user_id=device_user_id,
-                        registration=registration,
-                        name=name,
-                        jpeg_path=jpeg_path,
-                    ),
-                ),
-                (
-                    "multipart",
-                    lambda: self._send_face_via_multipart(
-                        device_user_id=device_user_id,
-                        registration=registration,
-                        name=name,
-                        jpeg_path=jpeg_path,
-                    ),
-                ),
-            ]
-        )
-        return attempts
+    def _panel_http(self) -> httpx.Client:
+        """Sessão do painel web: login por cookie, sem Basic Auth."""
+        return httpx.Client(timeout=self.timeout, follow_redirects=True)
 
-    def _add_plain_user(self, name: str, registration: str) -> dict[str, Any]:
-        """Cria o usuário sem foto (o facial rejeita FaceUrl no add) e devolve como aparece na lista."""
-        payload = {
-            "target": "user",
-            "action": "add",
-            "data": {
-                "item": [
-                    {
-                        "Name": name.strip()[:60],
-                        "UserID": registration,
-                        "ScheduleRelay": ALWAYS_SCHEDULE_RELAY,
-                        "WebRelay": "0",
-                        "LiftFloorNum": "9999",
-                        "Validity": FACE_VALIDITY_ALWAYS,
-                    }
-                ]
-            },
-        }
+    def _add_via_panel(self, name: str, registration: str, jpeg_path: Path) -> None:
+        """Cria usuário e rosto pelo /fcgi, como o botão Salvar do painel do Intelbras.
+
+        Os faciais do clube não têm API oficial. Pelos endereços /api/user/*
+        (user/add e depois user/set com FaceUrl), todo rosto novo caía no FaceID
+        do último cadastrado; pelo caminho do painel, cada um recebe o seu.
+        Por isso rosto só entra por aqui.
+        """
         try:
-            with self._client() as client:
-                response = client.post(self._url("/api/user/add"), json=payload)
-                response.raise_for_status()
-                result = self._check(response.json(), "user/add")
-        except httpx.HTTPError as exc:
-            raise DeviceError(f"Falha ao cadastrar usuário no XPE: {exc}") from exc
-        user = self.find_user_by_registration(registration)
-        if not user:
+            with self._panel_http() as http:
+                intelbras_fcgi.login(http, self.base_url, self.login_name, self.password)
+                intelbras_fcgi.add_user_with_face(
+                    http, self.base_url, registration, name, Path(jpeg_path).read_bytes()
+                )
+        except intelbras_fcgi.PanelUnavailable as exc:
             raise DeviceError(
-                f"Usuário criado ({registration}), mas não apareceu na lista do equipamento. "
-                f"Resposta: {result}"
-            )
-        return user
+                f"O facial {self.base_url} não respondeu como o painel do Intelbras (/fcgi): {exc}"
+            ) from exc
+        except intelbras_fcgi.PanelError as exc:
+            raise DeviceError(f"{self.base_url}: {exc}") from exc
+        except httpx.HTTPError as exc:
+            raise DeviceError(f"Falha ao cadastrar pelo painel do facial {self.base_url}: {exc}") from exc
+
+    def _wait_for_user(self, registration: str) -> dict[str, Any]:
+        for attempt in range(FACE_CONFIRM_RETRIES):
+            user = self.find_user_by_registration(registration)
+            if user:
+                return user
+            if attempt + 1 < FACE_CONFIRM_RETRIES:
+                time.sleep(FACE_CONFIRM_DELAY)
+        raise DeviceError(
+            f"O facial {self.base_url} recebeu o cadastro de {registration}, mas ele não apareceu na lista."
+        )
 
     def create_user_with_face(
         self,
@@ -429,106 +367,33 @@ class IntelbrasClient:
         image_path: Path,
         *,
         registration: Optional[str] = None,
-        face_public_url: Optional[str] = None,
         image_ready: bool = False,
     ) -> CreatedUser:
-        reg = (registration or f"AP{int(time.time()) % 100000000:08d}")[:12]
+        """Cadastra usuário e rosto pelo painel e confere que o facial gerou um rosto só dele."""
+        reg = registration or f"AP{int(time.time()) % 100000000:08d}"
+        if not registration_fits_panel(reg):
+            raise DeviceError(
+                f"A matrícula {reg} não cabe no facial: só letras e números, até 11 caracteres."
+            )
         jpeg_path = image_path if image_ready else _ensure_jpeg_file(image_path)
-
-        user = self._add_plain_user(name, reg)
-        device_id = int(user["ID"])
+        self._add_via_panel(name, reg, jpeg_path)
         try:
-            face_ok = self._send_face(
-                registration=reg,
-                name=name,
-                jpeg_path=jpeg_path,
-                device_user_id=device_id,
-                face_public_url=face_public_url,
-            )
+            user = self._wait_for_user(reg)
+            face_ok = self._face_confirmed(reg, retries=PANEL_CONFIRM_RETRIES, name=name)
         except FaceIDConflict:
-            try:
-                self.delete_user(registration=reg)
-            except DeviceError as exc:
-                logger.warning("Rollback do usuário %s falhou: %s", reg, exc)
+            self._rollback(reg)
             raise
-
-        try:
-            self._grant_always_access(
-                device_user_id=device_id,
-                registration=reg,
-                name=name,
-                current=user,
-            )
-        except DeviceError as exc:
-            logger.warning("Relé permitido / validade sempre não confirmados: %s", exc)
-
         if not face_ok:
-            logger.error(
-                "Face não confirmada para %s — removendo cadastro incompleto do XPE",
-                reg,
-            )
-            try:
-                self.delete_user(registration=reg)
-            except DeviceError as exc:
-                logger.warning("Rollback do usuário %s falhou: %s", reg, exc)
+            logger.error("Face não confirmada para %s — removendo cadastro incompleto do facial", reg)
+            self._rollback(reg)
             raise DeviceError(FACE_NOT_ACCEPTED_MSG)
+        return CreatedUser(device_user_id=int(user["ID"]), registration=reg, face_ok=True)
 
-        return CreatedUser(
-            device_user_id=device_id,
-            registration=reg,
-            face_ok=True,
-        )
-
-    def _send_face(
-        self,
-        *,
-        registration: str,
-        name: str,
-        jpeg_path: Path,
-        device_user_id: int,
-        face_public_url: Optional[str] = None,
-    ) -> bool:
-        """Tenta vários métodos, em rodadas, até o XPE gerar o modelo do rosto."""
-        previous = self._face_signature(registration) or ()
-        attempts = self._face_attempts(
-            registration=registration,
-            name=name,
-            jpeg_path=jpeg_path,
-            device_user_id=device_user_id,
-            face_public_url=face_public_url,
-        )
-        rounds = 1 if len(attempts) == 1 else FACE_SEND_ROUNDS
-        for round_num in range(rounds):
-            for label, action in attempts:
-                try:
-                    action()
-                except Exception as exc:  # noqa: BLE001 — tenta o próximo método
-                    logger.warning(
-                        "Face via %s (rodada %s) falhou (reg=%s): %s",
-                        label,
-                        round_num + 1,
-                        registration,
-                        exc,
-                    )
-                    continue
-                # FaceID repetido levanta FaceIDConflict: outro método não muda o FaceID, então para aqui.
-                if self._face_confirmed(registration, previous=previous, name=name):
-                    logger.info(
-                        "Face confirmada via %s na rodada %s (reg=%s)",
-                        label,
-                        round_num + 1,
-                        registration,
-                    )
-                    return True
-                logger.warning(
-                    "%s aceito na rodada %s, mas o facial não gerou o modelo do rosto (reg=%s)",
-                    label,
-                    round_num + 1,
-                    registration,
-                )
-            if round_num + 1 < rounds:
-                time.sleep(1.5)
-        return False
+    def _rollback(self, registration: str) -> None:
+        try:
+            self.delete_user(registration=registration)
+        except DeviceError as exc:
+            logger.warning("Rollback do usuário %s falhou: %s", registration, exc)
 
     def _raise_conflict(self, registration: str, name: str, others: list[str]) -> None:
         logger.error(
@@ -552,112 +417,6 @@ class IntelbrasClient:
             "Refazer facial do zero ou fale com a Intelbras.",
             registrations,
         )
-
-    def _send_face_via_data_uri(
-        self,
-        *,
-        device_user_id: int,
-        registration: str,
-        name: str,
-        jpeg_path: Path,
-    ) -> None:
-        encoded = _prepare_jpeg_base64(jpeg_path)
-        self.update_user(
-            device_user_id=device_user_id,
-            registration=registration,
-            name=name,
-            face_public_url=f"data:image/jpeg;base64,{encoded}",
-        )
-
-    def _next_face_id(self) -> int:
-        """FaceID que ninguém usa neste facial.
-
-        Só a lista da API pode vir cortada pela paginação, e um FaceID de outro
-        sócio fazia o rosto novo liberar no nome dele. Sem o export, que traz
-        todos, este método de envio não é usado.
-        """
-        exported = self.export_users()
-        if exported is None:
-            raise DeviceError("Sem o export do facial não dá para escolher um FaceID livre.")
-        used = {u.face_id for u in exported if u.face_id}
-        used.update(_clean_face_id(user.get("FaceID")) for user in self.list_users())
-        max_face = 0
-        for face_id in used:
-            try:
-                max_face = max(max_face, int(face_id))
-            except (TypeError, ValueError):
-                pass
-        return max_face + 1
-
-    def _put_register_img(self, face_id: int, jpeg_bytes: bytes) -> str:
-        # O arquivo conta a partir de 0: o FaceID 12 é RegisterImg/11.jpg.
-        path = f"/Image/RegisterImg/{face_id - 1}.jpg"
-        last_error: Optional[Exception] = None
-        with self._client() as client:
-            for verb in (client.put, client.post):
-                try:
-                    response = verb(
-                        self._url(path),
-                        content=jpeg_bytes,
-                        headers={"Content-Type": "image/jpeg"},
-                    )
-                    if response.status_code in {200, 201, 204}:
-                        return f"{self.base_url}{path}"
-                    last_error = DeviceError(
-                        f"HTTP {response.status_code}: {response.text[:120]}"
-                    )
-                except httpx.HTTPError as exc:
-                    last_error = exc
-        raise DeviceError(f"Não foi possível gravar {path}: {last_error}")
-
-    def _send_face_via_register_img(
-        self,
-        *,
-        registration: str,
-        name: str,
-        jpeg_path: Path,
-        device_user_id: int,
-    ) -> None:
-        face_id = self._next_face_id()
-        img_url = self._put_register_img(face_id, Path(jpeg_path).read_bytes())
-        self.update_user(
-            device_user_id=device_user_id,
-            registration=registration,
-            name=name,
-            face_public_url=img_url,
-        )
-
-    def _send_face_via_multipart(
-        self,
-        *,
-        device_user_id: int,
-        registration: str,
-        name: str,
-        jpeg_path: Path,
-    ) -> None:
-        jpeg_bytes = Path(jpeg_path).read_bytes()
-        form_base = {
-            "target": "user",
-            "action": "set",
-            "ID": str(device_user_id),
-            "UserID": registration,
-            "Name": name.strip()[:60],
-        }
-        last_error: Optional[Exception] = None
-        with self._client() as client:
-            for field in ("Face", "face", "File", "file", "image", "Image"):
-                try:
-                    response = client.post(
-                        self._url("/api/user/set"),
-                        data=form_base,
-                        files={field: ("face.jpg", jpeg_bytes, "image/jpeg")},
-                    )
-                    response.raise_for_status()
-                    self._check(response.json(), f"user/set multipart ({field})")
-                    return
-                except Exception as exc:  # noqa: BLE001
-                    last_error = exc
-        raise DeviceError(f"Upload multipart da face rejeitado: {last_error}")
 
     def _grant_always_access(
         self,
@@ -701,39 +460,6 @@ class IntelbrasClient:
             name=name,
             current=known,
         )
-
-    def update_user(
-        self,
-        *,
-        device_user_id: int,
-        registration: str,
-        name: Optional[str] = None,
-        image_path: Optional[Path] = None,
-        face_public_url: Optional[str] = None,
-    ) -> None:
-        item: dict[str, Any] = {
-            "ID": str(device_user_id),
-            "UserID": registration,
-            "ScheduleRelay": ALWAYS_SCHEDULE_RELAY,
-            "WebRelay": "0",
-            "LiftFloorNum": "9999",
-            "Validity": FACE_VALIDITY_ALWAYS,
-        }
-        if name:
-            item["Name"] = name.strip()[:60]
-        if face_public_url:
-            item["FaceUrl"] = face_public_url
-        elif image_path:
-            item["FaceUrl"] = _prepare_jpeg_base64(_ensure_jpeg_file(image_path))
-
-        payload = {"target": "user", "action": "set", "data": {"item": [item]}}
-        try:
-            with self._client() as client:
-                response = client.post(self._url("/api/user/set"), json=payload)
-                response.raise_for_status()
-                self._check(response.json(), "user/set")
-        except httpx.HTTPError as exc:
-            raise DeviceError(f"Falha ao atualizar usuário: {exc}") from exc
 
     def _find_user(
         self,
@@ -861,66 +587,22 @@ class IntelbrasClient:
             logger.warning("Não foi possível ler logs do XPE: %s", last_error)
         return []
 
-    def _drop_shared_face(self, registration: str, name: str) -> None:
-        """Apaga do facial o usuário que divide o FaceID com outro, para recriar do zero.
-
-        Reenviar a foto no mesmo usuário mantém o FaceID repetido e troca o
-        rosto do outro sócio junto. Recriado, o usuário recebe um FaceID novo.
-        """
-        logger.warning(
-            "%s (reg=%s) divide o FaceID com outro usuário em %s: recriando",
-            name,
-            registration,
-            self.base_url,
-        )
-        self.delete_user(registration=registration)
-        return None
-
     def update_member_face(
         self,
         *,
         name: str,
         registration: str,
         image_path: Path,
-        face_public_url: Optional[str] = None,
     ) -> CreatedUser:
-        """Atualiza a foto facial de um membro já cadastrado (ou recria se sumiu)."""
+        """Troca a foto de um sócio: apaga do facial e cadastra de novo pelo painel.
+
+        O painel edita com outro comando (cUserEdit), ainda não usado aqui;
+        recriar dá o mesmo resultado e o rosto novo ganha um FaceID só dele.
+        """
         jpeg_path = _ensure_jpeg_file(image_path)
-        existing = self.find_user_by_registration(registration)
-        if existing and self.face_shared_with(registration):
-            existing = self._drop_shared_face(registration, name)
-        if existing:
-            device_id = int(existing["ID"])
-            face_ok = self._send_face(
-                registration=registration,
-                name=name,
-                jpeg_path=jpeg_path,
-                device_user_id=device_id,
-                face_public_url=face_public_url,
-            )
-            try:
-                self._grant_always_access(
-                    device_user_id=device_id,
-                    registration=registration,
-                    name=name,
-                    current=existing,
-                )
-            except DeviceError as exc:
-                logger.warning("Relé permitido / validade sempre não confirmados: %s", exc)
-            if not face_ok:
-                raise DeviceError(FACE_NOT_ACCEPTED_MSG)
-            return CreatedUser(
-                device_user_id=device_id,
-                registration=registration,
-                face_ok=True,
-            )
-        return self.create_user_with_face(
-            name,
-            jpeg_path,
-            registration=registration,
-            face_public_url=face_public_url,
-            image_ready=True,
-        )
+        if self.find_user_by_registration(registration):
+            self.delete_user(registration=registration)
+        return self.create_user_with_face(name, jpeg_path, registration=registration, image_ready=True)
 
     def register_member(
         self,
@@ -929,7 +611,6 @@ class IntelbrasClient:
         *,
         registration: Optional[str] = None,
         validity_days: int = VALIDITY_DAYS,
-        face_public_url: Optional[str] = None,
         image_ready: bool = False,
     ) -> CreatedUser:
         _ = validity_days
@@ -937,7 +618,6 @@ class IntelbrasClient:
             name,
             image_path,
             registration=registration,
-            face_public_url=face_public_url,
             image_ready=image_ready,
         )
 
@@ -948,72 +628,26 @@ class IntelbrasClient:
         registration: str,
         image_path: Optional[Path],
         previous_device_user_id: Optional[int] = None,
-        face_public_url: Optional[str] = None,
     ) -> CreatedUser:
+        """Renova: quem está no facial com o rosto dele fica como está; os outros são recriados.
+
+        Recria (apaga e cadastra pelo painel) quem divide o FaceID com outro,
+        quem está no facial sem rosto e quem não está no facial.
+        """
+        _ = previous_device_user_id
         self.ping()
         existing = self.find_user_by_registration(registration)
-        if existing and self.face_shared_with(registration):
-            if not image_path or not Path(image_path).exists():
-                raise DeviceError(
-                    f"{name} está no mesmo número de rosto (FaceID) de outro usuário no facial "
-                    f"{self.base_url}, e a foto salva não está neste PC. Envie uma foto nova pelo botão Foto."
-                )
-            existing = self._drop_shared_face(registration, name)
-        if existing:
-            device_id = int(existing["ID"])
-            face_ok = True
-            # Quem já tem o modelo do rosto no facial não precisa reenviar a foto.
-            has_model = bool((image_path or face_public_url) and self._face_signature(registration))
-            if image_path and not has_model:
-                face_ok = self._send_face(
-                    registration=registration,
-                    name=name,
-                    jpeg_path=_ensure_jpeg_file(image_path),
-                    device_user_id=device_id,
-                    face_public_url=face_public_url,
-                )
-            elif face_public_url and not has_model:
-                self.update_user(
-                    device_user_id=device_id,
-                    registration=registration,
-                    name=name,
-                    face_public_url=face_public_url,
-                )
-                if not self._face_confirmed(registration):
-                    raise DeviceError(FACE_NOT_ACCEPTED_MSG)
-            try:
-                self._grant_always_access(
-                    device_user_id=device_id,
-                    registration=registration,
-                    name=name,
-                    current=existing,
-                )
-            except DeviceError as exc:
-                logger.warning("Relé permitido / validade sempre não confirmados: %s", exc)
-            if image_path and not face_ok:
-                raise DeviceError(FACE_NOT_ACCEPTED_MSG)
-            return CreatedUser(
-                device_user_id=device_id,
-                registration=registration,
-                face_ok=True,
-            )
-
+        if existing and not self.face_shared_with(registration) and self._face_signature(registration):
+            return CreatedUser(device_user_id=int(existing["ID"]), registration=registration, face_ok=True)
         if not image_path or not Path(image_path).exists():
             raise DeviceError(
-                "A foto salva não foi encontrada para recriar o acesso facial. "
-                "Envie uma foto nova pelo botão Foto."
+                f"A foto salva de {name} não está neste PC, e o facial {self.base_url} precisa dela "
+                "para cadastrar o rosto. Envie uma foto nova pelo botão Foto."
             )
-        if previous_device_user_id is not None:
-            try:
-                self.delete_user(registration=registration)
-            except DeviceError:
-                pass
-        return self.create_user_with_face(
-            name,
-            Path(image_path),
-            registration=registration,
-            face_public_url=face_public_url,
-        )
+        if existing:
+            self.delete_user(registration=registration)
+        return self.create_user_with_face(name, Path(image_path), registration=registration)
+
 
 
 def device_clients() -> list[IntelbrasClient]:
@@ -1071,7 +705,6 @@ class DeviceFleet:
         *,
         registration: Optional[str] = None,
         validity_days: int = VALIDITY_DAYS,
-        face_public_url: Optional[str] = None,
     ) -> CreatedUser:
         if not self.clients:
             raise DeviceError("Nenhum facial configurado (DEVICE_URL).")
@@ -1089,7 +722,6 @@ class DeviceFleet:
                     jpeg_path,
                     registration=shared_registration,
                     validity_days=validity_days,
-                    face_public_url=face_public_url,
                     image_ready=True,
                 )
             except DeviceError as exc:
@@ -1140,7 +772,6 @@ class DeviceFleet:
         registration: str,
         image_path: Optional[Path],
         previous_device_user_id: Optional[int] = None,
-        face_public_url: Optional[str] = None,
     ) -> CreatedUser:
         return self._map_user(
             "renovar",
@@ -1149,7 +780,6 @@ class DeviceFleet:
                 registration=registration,
                 image_path=image_path,
                 previous_device_user_id=previous_device_user_id,
-                face_public_url=face_public_url,
             ),
         )
 
@@ -1159,7 +789,6 @@ class DeviceFleet:
         name: str,
         registration: str,
         image_path: Path,
-        face_public_url: Optional[str] = None,
     ) -> CreatedUser:
         return self._map_user(
             "atualizar a foto",
@@ -1167,7 +796,6 @@ class DeviceFleet:
                 name=name,
                 registration=registration,
                 image_path=image_path,
-                face_public_url=face_public_url,
             ),
         )
 
@@ -1256,6 +884,10 @@ def _int_or_none(value: object) -> Optional[int]:
         return None
 
 
+def registration_fits_panel(registration: object) -> bool:
+    return intelbras_fcgi.registration_fits(str(registration or ""))
+
+
 def _clean_face_id(value: object) -> str:
     """FaceID como texto; vazio quando o usuário não tem rosto.
 
@@ -1304,9 +936,9 @@ def _jpeg_ready(path: Path) -> bool:
 def _ensure_jpeg_file(image_path: Path) -> Path:
     """Devolve um JPEG pronto para o facial, sem regravar o que já está pronto.
 
-    Um facial baixa a foto pela FaceUrl enquanto o outro recebe a mesma foto.
-    Regravar o arquivo no meio do download entregava um JPEG cortado, então a
-    foto pronta não é tocada e a nova vai para um temporário trocado de uma vez.
+    Os dois faciais recebem a mesma foto ao mesmo tempo. Regravar o arquivo
+    no meio de um envio entregava um JPEG cortado, então a foto pronta não é
+    tocada e a nova vai para um temporário trocado de uma vez.
     """
     path = Path(image_path)
     if not path.exists():

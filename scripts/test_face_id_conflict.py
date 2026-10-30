@@ -65,24 +65,18 @@ class PhotoDevice(FakeDevice):
         return out.getvalue()
 
 
-def _serve(device: FakeDevice, photo: Path, name: str) -> str:
-    url = f"http://pc/media/{name}"
-    device.served_photos[url] = photo.read_bytes()
-    return url
-
-
 def test_conflict_on_register_is_rolled_back(tmp: Path) -> None:
     device = PhotoDevice()
     client = FakeClient(device)
     homem = ic.prepare_face_photo(_photo(tmp / "homem.jpg"))
-    client.register_member("Homem", homem, registration="H1", face_public_url=_serve(device, homem, "homem.jpg"), image_ready=True)
+    client.register_member("Homem", homem, registration="H1", image_ready=True)
     face_homem = device._by_userid("H1")["FaceID"]
 
     # O facial reaproveita o FaceID do Homem para o rosto da Sócia.
     device.next_face = int(face_homem)
     socia = ic.prepare_face_photo(_photo(tmp / "socia.jpg", size=(500, 640)))
     try:
-        client.register_member("Socia", socia, registration="S1", face_public_url=_serve(device, socia, "socia.jpg"), image_ready=True)
+        client.register_member("Socia", socia, registration="S1", image_ready=True)
     except ic.FaceIDConflict as exc:
         assert "Homem" in str(exc), exc
     else:
@@ -95,7 +89,6 @@ def test_renew_recreates_shared_face(tmp: Path) -> None:
     device = PhotoDevice()
     client = FakeClient(device)
     socia = ic.prepare_face_photo(_photo(tmp / "socia2.jpg", size=(520, 640)))
-    url = _serve(device, socia, "socia2.jpg")
     device.users["1"] = {"ID": "1", "UserID": "H2", "Name": "Homem", "FaceID": "50"}
     device.users["2"] = {"ID": "2", "UserID": "S2", "Name": "Socia", "FaceID": "50"}
     device.templates["50"] = b"modelo:homem"
@@ -103,34 +96,11 @@ def test_renew_recreates_shared_face(tmp: Path) -> None:
     assert client.face_shared_with("S2") == ["Homem"]
 
     device.next_face = 300
-    client.renew_member(name="Socia", registration="S2", image_path=socia, face_public_url=url)
+    client.renew_member(name="Socia", registration="S2", image_path=socia)
     renewed = device._by_userid("S2")
     assert renewed["FaceID"] == "300", "renovação recria quem divide FaceID e ganha um novo"
     assert client.face_shared_with("S2") == []
     assert device._by_userid("H2")["FaceID"] == "50"
-
-
-def test_next_face_id_needs_export() -> None:
-    device = PhotoDevice()
-    client = FakeClient(device)
-    # A lista da API veio cortada: só o export mostra o FaceID 80 em uso.
-    device.users["1"] = {"ID": "1", "UserID": "A", "Name": "A", "FaceID": "80"}
-    original = device.handler
-
-    def short_list(request: httpx.Request) -> httpx.Response:
-        if request.url.path == "/api/user/get":
-            return httpx.Response(200, json={"retcode": 0, "data": {"item": []}})
-        return original(request)
-
-    device.handler = short_list  # type: ignore[method-assign]
-    assert client._next_face_id() == 81, "FaceID livre vem do export, não da lista cortada"
-    device.export_works = False
-    try:
-        client._next_face_id()
-    except ic.DeviceError:
-        pass
-    else:
-        raise AssertionError("sem export não escolhe FaceID")
 
 
 def test_audit_finds_each_problem(tmp: Path) -> None:
@@ -150,7 +120,7 @@ def test_audit_finds_each_problem(tmp: Path) -> None:
         return db.create_member(name=name, registration=reg, device_user_id=None, photo_path=str(photo), expires_at=kw.get("expires", later), pool="termica")
 
     ok_photo = ic.prepare_face_photo(_photo(tmp / "ok.jpg"))
-    client.register_member("Certo", ok_photo, registration="OK1", face_public_url=_serve(device, ok_photo, "ok.jpg"), image_ready=True)
+    client.register_member("Certo", ok_photo, registration="OK1", image_ready=True)
     member("Certo", "OK1", ok_photo)
 
     member("Faltando", "F1", ok_photo)
@@ -349,7 +319,6 @@ def main() -> None:
         root = Path(tmp)
         test_conflict_on_register_is_rolled_back(root)
         test_renew_recreates_shared_face(root)
-        test_next_face_id_needs_export()
         test_audit_finds_each_problem(root)
         test_fix_all_safe(root)
         test_conflict_repairs_the_other_member(root)

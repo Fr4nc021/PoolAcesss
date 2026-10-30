@@ -231,7 +231,6 @@ def test_ok_exam_resends_saved_photo(tmp: Path) -> None:
     assert not renewed.access_blocked and not renewed.is_expired
     sent = fleet.sent[-1]
     assert sent["image_path"].suffix == ".jpg", "foto antiga em PNG vai convertida"
-    assert sent["face_public_url"].endswith(f"/media/{sent['image_path'].name}"), "facial baixa o JPEG"
 
     lost = db.create_member(
         name="Edu", registration="M004", device_user_id=4, photo_path=str(tmp / "sumiu.jpg"),

@@ -33,7 +33,6 @@ from app.intelbras_client import (
     _clean_face_id,
     _photo_face_id,
     _prepare_jpeg_base64,
-    public_media_url,
 )
 
 PROBE_REGISTRATION = "APFIDTESTE"
@@ -155,15 +154,13 @@ def _cleanup(client: IntelbrasClient) -> Any:
 def _create_test(client: IntelbrasClient, photo: bytes, before: dict[str, Any]) -> dict[str, Any]:
     """Cadastra o usuário de teste pelo caminho dos sócios e mostra os números que ele ganhou."""
     result: dict[str, Any] = {"teste": "cadastro como um sócio"}
-    # Como no cadastro de verdade, o facial baixa a foto deste PC pela FaceUrl.
+    # Pelo mesmo caminho dos sócios: usuário e foto juntos pelo painel.
     ensure_directories()
     path = PHOTOS_DIR / f"teste_faceid_{uuid.uuid4().hex[:8]}.jpg"
     path.write_bytes(photo)
-    face_url = public_media_url(path.name)
-    result["foto_por_endereco"] = bool(face_url)
     try:
         created = client.create_user_with_face(
-            PROBE_NAME, path, registration=PROBE_REGISTRATION, face_public_url=face_url, image_ready=True
+            PROBE_NAME, path, registration=PROBE_REGISTRATION, image_ready=True
         )
         result["id_dado"] = str(created.device_user_id)
     except DeviceError as exc:

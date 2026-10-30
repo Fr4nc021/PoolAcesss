@@ -22,8 +22,7 @@ from typing import Any, Optional
 
 from app import db, face_audit, updater
 from app.config import registration_pools, selected_pools
-from app.intelbras_client import DeviceError, FaceIDConflict, IntelbrasClient, face_photo, public_media_url
-from app.netcheck import lan_ip_problem
+from app.intelbras_client import DeviceError, FaceIDConflict, IntelbrasClient, face_photo
 
 logger = logging.getLogger(__name__)
 
@@ -112,15 +111,9 @@ def recreate_on_device(
     e, ao sair, leva o rosto do outro junto. Então o outro é refeito com a
     foto dele, para não ficar sem entrar por causa deste.
     """
-    face_url = public_media_url(photo.name)
     client.delete_user(registration=member.registration)
     try:
-        client.create_user_with_face(
-            member.name,
-            photo,
-            registration=member.registration,
-            face_public_url=face_url,
-        )
+        client.create_user_with_face(member.name, photo, registration=member.registration)
     except FaceIDConflict as exc:
         if not repair_others:
             raise
@@ -264,9 +257,6 @@ def _run() -> None:
 
 def start() -> tuple[bool, str]:
     """Começa a correção em segundo plano. Falso com o motivo se não deu para começar."""
-    problem = lan_ip_problem()
-    if problem:
-        return False, problem
     with _lock:
         if _state.get("running"):
             return False, "Já tem uma correção em andamento."
